@@ -209,6 +209,9 @@ internal static class Program
             window.Measure(new System.Windows.Size(1040, 720));
             window.Arrange(new System.Windows.Rect(0, 0, 1040, 720));
             Assert(window.MinWidth >= 920 && window.MinHeight >= 620 && window.Content is System.Windows.Controls.Grid && window.Title == "Roblox Multi-Account Launcher", "main window resources or constraints failed to load");
+            Assert(window.Background is System.Windows.Media.SolidColorBrush background && background.Color.R < 40 && background.Color.G < 40 && background.Color.B < 40, "window background is not explicitly dark");
+            Assert(window.FindName("GlobalLaunchButton") is System.Windows.Controls.Button launchButton && Equals(launchButton.Content, "Launch Roblox"), "persistent Launch Roblox control is missing");
+            Assert(window.FindName("GlobalLaunchAnotherButton") is System.Windows.Controls.Button, "persistent Launch Another Client control is missing");
             window.AllowImmediateCloseForTest();
             window.Close();
         });

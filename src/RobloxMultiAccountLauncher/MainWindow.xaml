@@ -3,9 +3,10 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:models="clr-namespace:RobloxMultiAccountLauncher.Models"
         Title="Roblox Multi-Account Launcher" Width="1040" Height="720" MinWidth="920" MinHeight="620"
+        Background="{StaticResource BackgroundBrush}" Foreground="{StaticResource TextBrush}"
         WindowStartupLocation="CenterScreen">
-    <Grid Margin="22">
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Grid Margin="22" Background="{StaticResource BackgroundBrush}">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
         <Grid Grid.Row="0" Margin="0,0,0,16">
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <StackPanel>
@@ -17,7 +18,19 @@
             </Border>
         </Grid>
 
-        <TabControl Grid.Row="1" x:Name="MainTabs">
+        <Border Grid.Row="1" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="Quick Launch" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="GlobalBackendSummary" Text="Detecting launch backend…" Foreground="{StaticResource SecondaryTextBrush}" Margin="0,3,12,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" x:Name="GlobalLaunchButton" Content="Launch Roblox" Style="{StaticResource PrimaryButton}" Click="LaunchButton_Click" Margin="10,0,8,0" MinWidth="142"/>
+                <Button Grid.Column="2" x:Name="GlobalLaunchAnotherButton" Content="Launch Another Client" Click="LaunchButton_Click" IsEnabled="False" MinWidth="172"/>
+            </Grid>
+        </Border>
+
+        <TabControl Grid.Row="2" x:Name="MainTabs" Background="{StaticResource BackgroundBrush}">
             <TabItem Header="Home">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,16,0,8">
                     <Grid>
@@ -98,6 +111,7 @@
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
                     </ScrollViewer>
+                    <TextBlock Grid.Row="1" x:Name="NoClientsMessage" Text="No Roblox clients detected. Use Launch Roblox above to start one." Foreground="{StaticResource SecondaryTextBrush}" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"/>
                 </Grid>
             </TabItem>
 
@@ -157,7 +171,7 @@
             </TabItem>
         </TabControl>
 
-        <Border Grid.Row="2" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="0,10,0,0">
+        <Border Grid.Row="3" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="0,10,0,0">
             <DockPanel><TextBlock x:Name="StateText" Text="Normal" FontWeight="SemiBold"/><TextBlock x:Name="FooterText" DockPanel.Dock="Right" Foreground="{StaticResource SecondaryTextBrush}" Text="Local only • No telemetry"/></DockPanel>
         </Border>
     </Grid>

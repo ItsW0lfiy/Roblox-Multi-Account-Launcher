@@ -129,6 +129,7 @@ public partial class MainWindow : Window
         _previousClients = current.ToDictionary(client => client.ProcessId);
 
         ClientCountText.Text = $"{current.Count} running";
+        NoClientsMessage.Visibility = current.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         ClientsList.Items.Refresh();
         HandleAutoDisable(current.Count);
         UpdateVisualState();
@@ -270,7 +271,8 @@ public partial class MainWindow : Window
     private async void LaunchButton_Click(object sender, RoutedEventArgs e)
     {
         if (_operationActive || _launchService.IsLaunching) return;
-        if (ReferenceEquals(sender, LaunchAnotherButton) && (!_multiAccount.MultiInstanceEnabled || !_multiAccount.TeleportProtectionEnabled))
+        var launchAnother = ReferenceEquals(sender, LaunchAnotherButton) || ReferenceEquals(sender, GlobalLaunchAnotherButton);
+        if (launchAnother && (!_multiAccount.MultiInstanceEnabled || !_multiAccount.TeleportProtectionEnabled))
         {
             MessageBox.Show("Multi-account protection is no longer healthy. Re-prepare multi-account mode first.", "Protection unavailable", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
@@ -464,9 +466,13 @@ public partial class MainWindow : Window
         CookieStateText.Text = _multiAccount.TeleportProtectionEnabled ? "Enabled" : multi ? "Warning" : "Disabled";
         CookieStateText.Foreground = ResourceBrush(_multiAccount.TeleportProtectionEnabled ? "SuccessBrush" : multi ? "WarningBrush" : "SecondaryTextBrush");
         var resolved = _detection.Resolve(_settings.LaunchBackend);
-        BackendSummary.Text = $"{_settings.LaunchBackend} → {LaunchService.BackendName(resolved)}  •  Protocol owner: {_detection.RobloxProtocol.Owner}";
+        var backendText = $"{_settings.LaunchBackend} → {LaunchService.BackendName(resolved)}  •  Protocol owner: {_detection.RobloxProtocol.Owner}";
+        BackendSummary.Text = backendText;
+        GlobalBackendSummary.Text = backendText;
         LaunchAnotherButton.IsEnabled = !_operationActive && _multiAccount.MultiInstanceEnabled && _multiAccount.TeleportProtectionEnabled;
+        GlobalLaunchAnotherButton.IsEnabled = LaunchAnotherButton.IsEnabled;
         LaunchButton.IsEnabled = !_operationActive;
+        GlobalLaunchButton.IsEnabled = LaunchButton.IsEnabled;
         MultiToggle.IsEnabled = !_operationActive;
         UpdateTray();
     }
@@ -523,7 +529,9 @@ public partial class MainWindow : Window
     private void SetBusy(bool busy)
     {
         LaunchButton.IsEnabled = !busy;
+        GlobalLaunchButton.IsEnabled = !busy;
         LaunchAnotherButton.IsEnabled = !busy && _multiAccount.TeleportProtectionEnabled;
+        GlobalLaunchAnotherButton.IsEnabled = LaunchAnotherButton.IsEnabled;
         MultiToggle.IsEnabled = !busy;
     }
 
