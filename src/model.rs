@@ -33,6 +33,23 @@ pub enum LayoutMode {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateChannel {
+    Stable,
+    Prerelease,
+}
+
+impl UpdateChannel {
+    pub const ALL: [Self; 2] = [Self::Stable, Self::Prerelease];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Prerelease => "Prerelease",
+        }
+    }
+}
+
 impl LayoutMode {
     pub const ALL: [Self; 3] = [Self::FiftyFifty, Self::PrimarySecondary, Self::Vertical];
     pub fn label(self) -> &'static str {
@@ -135,6 +152,8 @@ pub struct Settings {
     pub launch_timeout_seconds: u64,
     pub graceful_close_seconds: u64,
     pub powershell_assist: bool,
+    pub automatic_update_checks: bool,
+    pub update_channel: UpdateChannel,
 }
 
 impl Default for Settings {
@@ -147,6 +166,8 @@ impl Default for Settings {
             launch_timeout_seconds: 45,
             graceful_close_seconds: 8,
             powershell_assist: true,
+            automatic_update_checks: true,
+            update_channel: UpdateChannel::Stable,
         }
     }
 }

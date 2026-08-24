@@ -5,10 +5,12 @@ use crate::{
     local_state::{LocalStateTracer, TraceEvent},
     model::{
         Activity, Detection, LaunchBackend, LayoutMode, ProtectionState, RobloxClient, Settings,
+        UpdateChannel,
     },
     platform::{self, AppInstanceGuard, ProtectionController, ProtectionEvent},
     powershell::{self, PowerShellInfo, PowerShellKind},
     settings::{self, Logger, SettingsStore},
+    updater::{self, UpdateManager, UpdateNotice, UpdateState},
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::{
@@ -41,6 +43,7 @@ enum Dialog {
         exit_after: bool,
     },
     ForceClient(u32),
+    UpdateBlocked(String),
 }
 
 enum CloseEvent {
@@ -111,6 +114,9 @@ pub struct LauncherApp {
     exit_after_disable: bool,
     smoke_test: bool,
     started: Instant,
+    updater: UpdateManager,
+    automatic_update_started: bool,
+    dismissed_update: Option<String>,
 }
 
 impl LauncherApp {
@@ -135,6 +141,20 @@ impl LauncherApp {
         let (tray, tray_ids) = build_tray();
         let clients = platform::enumerate_clients();
         let instance_paths = InstancePathManager::new(root.join("Instances"), !clients.is_empty());
+        let updater = UpdateManager::new(root.join("Updates"), settings.update_channel);
+        let updater_error = updater.snapshot().error;
+        let initial_status = updater_error
+            .as_ref()
+            .map(|message| format!("The previous update attempt failed: {message}"))
+            .unwrap_or_else(|| "Ready. Multi-account mode is off.".into());
+        let initial_activities = vec![Activity {
+            timestamp: SystemTime::now(),
+            message: updater_error
+                .as_ref()
+                .map(|message| format!("Previous update attempt failed: {message}"))
+                .unwrap_or_else(|| "Launcher started in normal mode.".into()),
+            error: updater_error.is_some(),
+        }];
         Self {
             _instance_guard: instance_guard,
             protection: ProtectionController::new("ROBLOX_singletonMutex", "ROBLOX_singletonEvent"),
@@ -154,13 +174,9 @@ impl LauncherApp {
             powershell,
             page: Page::Home,
             launch_text: "Launch Roblox".into(),
-            status: "Ready. Multi-account mode is off.".into(),
-            recent_error: None,
-            activities: vec![Activity {
-                timestamp: SystemTime::now(),
-                message: "Launcher started in normal mode.".into(),
-                error: false,
-            }],
+            status: initial_status,
+            recent_error: updater_error.clone(),
+            activities: initial_activities,
             last_refresh: Instant::now(),
             last_health: Instant::now(),
             dialog: None,
@@ -183,6 +199,9 @@ impl LauncherApp {
             exit_after_disable: false,
             smoke_test: std::env::args().any(|arg| arg.eq_ignore_ascii_case("--smoke-test")),
             started: Instant::now(),
+            updater,
+            automatic_update_started: false,
+            dismissed_update: None,
         }
     }
 
@@ -635,6 +654,56 @@ impl LauncherApp {
                 }
             }
         }
+        for notice in self.updater.poll() {
+            match notice {
+                UpdateNotice::BackgroundFailure(message) => {
+                    self.logger.write(
+                        "INFO",
+                        &format!("Background update check failed; launcher unaffected: {message}"),
+                    );
+                }
+                UpdateNotice::ManualFailure(message) => {
+                    self.status = format!("Updater failed: {message}");
+                    self.recent_error = Some(message.clone());
+                    self.add_activity(format!("Updater failed: {message}"), true);
+                }
+                UpdateNotice::Checked {
+                    available: true, ..
+                } => {
+                    self.dismissed_update = None;
+                    let version = self
+                        .updater
+                        .snapshot()
+                        .latest_version
+                        .unwrap_or_else(|| "unknown".into());
+                    self.add_activity(format!("Update v{version} is available."), false);
+                }
+                UpdateNotice::Checked {
+                    available: false,
+                    manual,
+                } => {
+                    if manual {
+                        self.status = "The launcher is up to date.".into();
+                        self.add_activity("Manual update check found no newer release.", false);
+                    }
+                }
+                UpdateNotice::DownloadReady(version) => {
+                    self.status = format!(
+                        "Update v{version} downloaded and verified. It is ready to install."
+                    );
+                    self.add_activity(
+                        format!("Update v{version} passed SHA-256 verification."),
+                        false,
+                    );
+                }
+                UpdateNotice::Cancelled => {
+                    self.status =
+                        "Update operation cancelled; the installed executable was unchanged."
+                            .into();
+                    self.add_activity("Update operation cancelled safely.", false);
+                }
+            }
+        }
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
@@ -700,6 +769,7 @@ impl LauncherApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let update = self.updater.snapshot();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(
@@ -727,6 +797,24 @@ impl LauncherApp {
                     ProtectionState::Disabled => ("NORMAL MODE", Color32::from_rgb(165, 169, 181)),
                 };
                 ui.label(RichText::new(label).strong().color(color));
+                if matches!(
+                    update.state,
+                    UpdateState::UpdateAvailable
+                        | UpdateState::ReadyToInstall
+                        | UpdateState::WaitingForSafeRestart
+                ) && update.latest_version.as_ref() != self.dismissed_update.as_ref()
+                {
+                    let text = format!(
+                        "Update available — v{}",
+                        update.latest_version.as_deref().unwrap_or("?")
+                    );
+                    if ui
+                        .button(RichText::new(text).color(Color32::from_rgb(230, 176, 70)))
+                        .clicked()
+                    {
+                        self.page = Page::Settings;
+                    }
+                }
             });
         });
         ui.add_space(14.0);
@@ -967,6 +1055,7 @@ impl LauncherApp {
     }
 
     fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
+        let update_snapshot = self.updater.snapshot();
         let report = diagnostics::report(diagnostics::ReportContext {
             detection: &self.detection,
             selected: self.settings.backend,
@@ -979,6 +1068,7 @@ impl LauncherApp {
             path_isolation_error: self.path_isolation_error.as_deref(),
             powershell: &self.powershell,
             recent_error: self.recent_error.as_deref(),
+            updater: &update_snapshot,
         });
         ui.horizontal(|ui| {
             ui.heading("Diagnostics");
@@ -1111,6 +1201,7 @@ impl LauncherApp {
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
+        let previous_channel = self.settings.update_channel;
         egui::Grid::new("settings-grid")
             .num_columns(2)
             .spacing([24.0, 14.0])
@@ -1185,7 +1276,29 @@ impl LauncherApp {
                     "Enable optional assistance",
                 );
                 ui.end_row();
+                ui.label("Automatic update checks");
+                ui.checkbox(
+                    &mut self.settings.automatic_update_checks,
+                    "Check quietly after startup",
+                );
+                ui.end_row();
+                ui.label("Update channel");
+                egui::ComboBox::from_id_salt("update-channel")
+                    .selected_text(self.settings.update_channel.label())
+                    .show_ui(ui, |ui| {
+                        for channel in UpdateChannel::ALL {
+                            ui.selectable_value(
+                                &mut self.settings.update_channel,
+                                channel,
+                                channel.label(),
+                            );
+                        }
+                    });
+                ui.end_row();
             });
+        if self.settings.update_channel != previous_channel {
+            self.updater.set_channel(self.settings.update_channel);
+        }
         if ui.button("Save Settings").clicked() {
             match self.settings_store.save(&self.settings) {
                 Ok(()) => {
@@ -1203,6 +1316,168 @@ impl LauncherApp {
             RichText::new("Multi-account mode is intentionally never persisted.")
                 .color(Color32::from_rgb(155, 159, 172)),
         );
+        ui.add_space(16.0);
+        self.update_settings(ui);
+    }
+
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        let blocked = if self.launch.busy() {
+            Some("Wait for the active Roblox launch attempt to finish before updating.".into())
+        } else {
+            updater::update_block_reason(
+                self.protection_state != ProtectionState::Disabled,
+                self.clients.len(),
+            )
+        };
+        if blocked.is_none() {
+            self.updater.mark_ready_if_safe();
+        }
+        let snapshot = self.updater.snapshot();
+        card(ui, "About & Updates", |ui| {
+            egui::Grid::new("updater-status")
+                .num_columns(2)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Application");
+                    ui.label("Roblox Multi-Account Launcher");
+                    ui.end_row();
+                    ui.label("Current version");
+                    ui.label(format!("v{}", snapshot.current_version));
+                    ui.end_row();
+                    ui.label("Updater configured");
+                    ui.label(if snapshot.configured { "Yes" } else { "No" });
+                    ui.end_row();
+                    ui.label("Channel");
+                    ui.label(snapshot.channel.label());
+                    ui.end_row();
+                    ui.label("Latest known version");
+                    ui.label(
+                        snapshot
+                            .latest_version
+                            .as_deref()
+                            .map(|version| format!("v{version}"))
+                            .unwrap_or_else(|| "Unknown".into()),
+                    );
+                    ui.end_row();
+                    ui.label("Last checked");
+                    ui.label(format_last_checked(snapshot.last_checked));
+                    ui.end_row();
+                    ui.label("Update status");
+                    ui.label(snapshot.state.label());
+                    ui.end_row();
+                    ui.label("Integrity");
+                    ui.label("Required SHA-256 manifest");
+                    ui.end_row();
+                });
+
+            if !snapshot.configured {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Updater not configured for a public repository yet.")
+                        .color(Color32::from_rgb(155, 159, 172)),
+                );
+            }
+            if let Some(error) = &snapshot.error {
+                ui.colored_label(Color32::from_rgb(238, 105, 113), error);
+            }
+            if let Some(blocked) = &blocked
+                && matches!(
+                    snapshot.state,
+                    UpdateState::UpdateAvailable
+                        | UpdateState::ReadyToInstall
+                        | UpdateState::WaitingForSafeRestart
+                )
+            {
+                ui.colored_label(Color32::from_rgb(230, 176, 70), blocked);
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        snapshot.configured && !snapshot.state.busy(),
+                        egui::Button::new("Check Now"),
+                    )
+                    .clicked()
+                {
+                    self.updater.start_check(true);
+                }
+                if matches!(
+                    snapshot.state,
+                    UpdateState::Checking | UpdateState::Downloading | UpdateState::Verifying
+                ) && ui.button("Cancel").clicked()
+                {
+                    self.updater.cancel();
+                }
+                if snapshot.state == UpdateState::UpdateAvailable {
+                    if ui.button("Update").clicked() {
+                        if let Some(reason) = blocked.clone() {
+                            self.dialog = Some(Dialog::UpdateBlocked(reason));
+                        } else {
+                            self.updater.start_download();
+                        }
+                    }
+                    if ui.button("Later").clicked() {
+                        self.dismissed_update = snapshot.latest_version.clone();
+                        self.status = "Update postponed for this launcher session.".into();
+                    }
+                }
+                if matches!(
+                    snapshot.state,
+                    UpdateState::ReadyToInstall | UpdateState::WaitingForSafeRestart
+                ) && ui.button("Update & Restart").clicked()
+                {
+                    let live_client_count = platform::enumerate_clients().len();
+                    let live_block = if self.launch.busy() {
+                        Some(
+                            "Wait for the active Roblox launch attempt to finish before updating."
+                                .into(),
+                        )
+                    } else {
+                        updater::update_block_reason(
+                            self.protection_state != ProtectionState::Disabled,
+                            live_client_count,
+                        )
+                    };
+                    if let Some(reason) = live_block {
+                        self.updater.mark_waiting_for_safe_restart();
+                        self.dialog = Some(Dialog::UpdateBlocked(reason));
+                    } else {
+                        match self.updater.start_install_helper() {
+                            Ok(()) => {
+                                self.status = "Installing verified update and restarting…".into();
+                                self.exit_confirmed = true;
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            Err(message) => {
+                                self.status = format!("Updater failed: {message}");
+                                self.recent_error = Some(message.clone());
+                                self.add_activity(format!("Updater failed: {message}"), true);
+                            }
+                        }
+                    }
+                }
+                if let Some(url) = &snapshot.release_url
+                    && ui.button("View Release").clicked()
+                    && let Err(message) = platform::shell_open_uri(url)
+                {
+                    self.status = format!("Could not open release page: {message}");
+                }
+            });
+
+            if let Some(name) = &snapshot.latest_name {
+                ui.add_space(8.0);
+                ui.label(RichText::new(name).strong());
+            }
+            if let Some(notes) = &snapshot.release_notes
+                && !notes.is_empty()
+            {
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.label(notes);
+                    });
+            }
+        });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1301,6 +1576,23 @@ impl LauncherApp {
                     self.dialog = Some(Dialog::ForceClient(pid));
                 }
             }
+            Dialog::UpdateBlocked(reason) => {
+                egui::Window::new("Update postponed")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.colored_label(Color32::from_rgb(230, 176, 70), reason.clone());
+                        ui.label("The launcher will not release protection or terminate Roblox to install an update.");
+                        ui.label("Finish Roblox sessions and disable Multi-Account Mode, then try again.");
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                if keep {
+                    self.dialog = Some(Dialog::UpdateBlocked(reason));
+                }
+            }
         }
     }
 }
@@ -1320,6 +1612,12 @@ impl eframe::App for LauncherApp {
                 self.protection.health_check();
             }
             self.last_health = Instant::now();
+        }
+        if !self.automatic_update_started && self.started.elapsed() >= Duration::from_secs(2) {
+            self.automatic_update_started = true;
+            if self.settings.automatic_update_checks {
+                self.updater.start_check(false);
+            }
         }
         if self.smoke_test && self.started.elapsed() > Duration::from_millis(800) {
             self.exit_confirmed = true;
@@ -1360,6 +1658,7 @@ impl eframe::App for LauncherApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.launch.cancel();
+        self.updater.cancel();
         self.stop_local_state_trace();
         self.ps_cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1410,6 +1709,22 @@ fn card(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
             content(ui);
         });
     ui.add_space(8.0);
+}
+
+fn format_last_checked(checked: Option<SystemTime>) -> String {
+    let Some(checked) = checked else {
+        return "Never".into();
+    };
+    let elapsed = SystemTime::now()
+        .duration_since(checked)
+        .unwrap_or_default();
+    if elapsed < Duration::from_secs(60) {
+        "Just now".into()
+    } else if elapsed < Duration::from_secs(60 * 60) {
+        format!("{} minute(s) ago", elapsed.as_secs() / 60)
+    } else {
+        format!("{} hour(s) ago", elapsed.as_secs() / 3_600)
+    }
 }
 
 fn state_row(ui: &mut egui::Ui, label: &str, value: &str, state: ProtectionState) {

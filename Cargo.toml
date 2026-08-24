@@ -11,7 +11,10 @@ eframe = { version = "0.35.0", default-features = false, features = ["default_fo
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1.12"
+semver = "1.0"
+sha2 = "0.10"
 tray-icon = "0.24.2"
+ureq = { version = "3.1", default-features = false, features = ["rustls"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

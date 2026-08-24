@@ -66,3 +66,15 @@ Scripts return JSON. Diagnostic scripts are read-only. The repair script reports
 ## Data
 
 Runtime data defaults to `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. `RMAL_DATA_DIR` redirects development/test data to project-contained `.tmp`. The application owns this persistence explicitly; generic `eframe` persistence is disabled. Multi-account mode is absent from the settings schema and always initializes disabled.
+
+## Portable updater
+
+`UpdateManager` is an isolated, non-critical Rust subsystem. Compile-time GitHub owner/repository constants are optional; when absent the state is `NotConfigured`, no background thread/request starts, and core launching is unaffected. When configured, a delayed startup check uses GitHub's public Releases REST endpoint through bounded HTTPS without a token. Stable selection ignores drafts and prereleases; the Prerelease channel uses semantic-version ordering.
+
+The explicit states are `NotConfigured`, `Idle`, `Checking`, `UpToDate`, `UpdateAvailable`, `Downloading`, `Verifying`, `ReadyToInstall`, `WaitingForSafeRestart`, `Installing`, and `Failed`. One atomic busy guard prevents overlapping checks/downloads. Cancellation is checked before requests and during bounded response streaming; partial executable files are deleted.
+
+Installation requires an exact-version machine-readable manifest and matching SHA-256. The verified executable is staged under `%LOCALAPPDATA%\RobloxMultiAccountLauncher\Updates`. With no active protection and no Roblox clients, the running executable copies itself to a temporary helper path and starts that same binary with `--self-update-helper`. The helper waits for the original PID, re-verifies SHA-256, copies the update beside the exact launched portable executable, renames the original to a unique rollback backup, promotes the replacement, and restarts it with `--self-update-cleanup`. The restarted application waits for the helper and removes only the named helper/staged/backup files. Replacement failure restores the original where possible and records a bounded application-owned error for the next launch.
+
+The updater never kills Roblox or releases the singleton/cookie resources to update. Protection-active updates remain notices until sessions finish and Multi-Account Mode is disabled. Automatic installation, installers, services, scheduled tasks, elevation, external runtimes, WebViews, and browser-rendered release notes are not used.
+
+The configuration has a reserved public-verification-key slot, but signature verification is deliberately not claimed or enabled without a real release pipeline. SHA-256 is mandatory now; signed manifests remain required hardening before public release. See `docs/UPDATER.md`.

@@ -9,11 +9,24 @@ mod model;
 mod platform;
 mod powershell;
 mod settings;
+mod updater;
 
 use app::LauncherApp;
 use platform::AppInstanceGuard;
 
 fn main() -> eframe::Result {
+    match updater::parse_internal_mode(std::env::args_os()) {
+        Ok(Some(mode)) => {
+            if updater::run_internal_mode(mode) {
+                return Ok(());
+            }
+        }
+        Ok(None) => {}
+        Err(message) => {
+            updater::record_helper_error(&message);
+            return Ok(());
+        }
+    }
     let Some(instance_guard) = AppInstanceGuard::acquire("Wolfy_RobloxMultiAccountLauncher") else {
         platform::activate_existing_window("Roblox Multi-Account Launcher");
         return Ok(());

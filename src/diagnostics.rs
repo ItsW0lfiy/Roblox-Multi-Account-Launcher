@@ -2,6 +2,7 @@ use crate::{
     instance_paths::InstanceRecord,
     model::{Detection, LaunchBackend, ProtectionState, RobloxClient},
     powershell::PowerShellInfo,
+    updater::UpdateSnapshot,
 };
 use regex::Regex;
 use std::sync::OnceLock;
@@ -36,6 +37,7 @@ pub struct ReportContext<'a> {
     pub path_isolation_error: Option<&'a str>,
     pub powershell: &'a PowerShellInfo,
     pub recent_error: Option<&'a str>,
+    pub updater: &'a UpdateSnapshot,
 }
 
 pub fn report(context: ReportContext<'_>) -> String {
@@ -51,6 +53,7 @@ pub fn report(context: ReportContext<'_>) -> String {
         path_isolation_error,
         powershell,
         recent_error,
+        updater,
     } = context;
     let resolved = detection.resolve(selected);
     let path_state = if protection == ProtectionState::Disabled {
@@ -84,7 +87,7 @@ pub fn report(context: ReportContext<'_>) -> String {
             .join("\n")
     };
     redact(&format!(
-        "Roblox Multi-Account Launcher\nVersion: {}\nArchitecture: Rust + egui/eframe + native Windows APIs\nMode: {}\n\nROBLOX\nInstalled: {}\nProcesses: {}\n{}: owner: {} ({}, registered: {})\n{}: owner: {} ({}, registered: {})\n\nFISHSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nBLOXSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nLAUNCH BACKEND\nSelected: {}\nResolved: {}\n\nMULTI-ACCOUNT\nApplication mutex: Owned\nShared singleton mutex: {}\nShared singleton event: {}\nCookie file: {}\nTeleport/login protection: {}\nMulti-instance protection: {}\nPer-instance path isolation: {}\nPath-isolation root: {}\nPath-isolation error: {}\nLogin-state behavior: Experimental / manually validated\n\nISOLATED CLIENT PATHS\n{}\n\nPOWERSHELL ASSIST\nEngine: {}\nVersion: {}\nStatus: {}\n\nRecent error: {}",
+        "Roblox Multi-Account Launcher\nVersion: {}\nArchitecture: Rust + egui/eframe + native Windows APIs\nMode: {}\n\nROBLOX\nInstalled: {}\nProcesses: {}\n{}: owner: {} ({}, registered: {})\n{}: owner: {} ({}, registered: {})\n\nFISHSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nBLOXSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nLAUNCH BACKEND\nSelected: {}\nResolved: {}\n\nMULTI-ACCOUNT\nApplication mutex: Owned\nShared singleton mutex: {}\nShared singleton event: {}\nCookie file: {}\nTeleport/login protection: {}\nMulti-instance protection: {}\nPer-instance path isolation: {}\nPath-isolation root: {}\nPath-isolation error: {}\nLogin-state behavior: Experimental / manually validated\n\nISOLATED CLIENT PATHS\n{}\n\nUPDATER\nConfigured: {}\nChannel: {}\nCurrent version: {}\nLatest known version: {}\nLast checked (Unix seconds): {}\nState: {}\nIntegrity: {}\n\nPOWERSHELL ASSIST\nEngine: {}\nVersion: {}\nStatus: {}\n\nRecent error: {}",
         env!("CARGO_PKG_VERSION"),
         if protection == ProtectionState::Disabled {
             "Normal"
@@ -142,6 +145,16 @@ pub fn report(context: ReportContext<'_>) -> String {
         crate::settings::data_root().join("Instances").display(),
         path_isolation_error.unwrap_or("None"),
         instance_details,
+        if updater.configured { "Yes" } else { "No" },
+        updater.channel.label(),
+        updater.current_version,
+        updater.latest_version.as_deref().unwrap_or("Unknown"),
+        updater
+            .last_checked
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(|| "Never".into(), |duration| duration.as_secs().to_string()),
+        updater.state.label(),
+        updater.signing,
         powershell.engine_label(),
         powershell.version.as_deref().unwrap_or("Unknown"),
         powershell.capability(),

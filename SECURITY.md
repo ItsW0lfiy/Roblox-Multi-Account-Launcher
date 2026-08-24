@@ -24,6 +24,14 @@ Diagnostics redact common cookie, ticket, token, bearer, authentication, and pri
 
 Harmless settings, sanitized logs, per-client junction aliases, and explicitly requested metadata traces are application-owned runtime data under `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. Multi-account mode, authentication material, and Roblox file contents are not persisted.
 
+## Update security
+
+The updater is dormant until real GitHub repository coordinates are compiled in. When configured, it may make unauthenticated HTTPS requests only for public GitHub release metadata and explicitly selected release assets; no diagnostics, Roblox state, or credentials are transmitted. Automatic checks never install updates.
+
+Installation requires a release tag and machine-readable manifest that agree with `Cargo.toml` semantic versioning, the exact executable asset name, and a locally calculated SHA-256 hash. The staged executable is re-verified by the same-binary helper immediately before replacement. Replacement keeps a unique rollback backup and targets the exact portable executable that was launched. It is blocked while Multi-Account Mode or Roblox clients are active.
+
+SHA-256 alone does not authenticate a compromised release source. Signed-manifest verification is deferred until the public release pipeline and offline private-key handling exist; configuring a public key before the verifier is implemented fails closed and refuses installation.
+
 ## Runtime dependencies
 
 The portable release requires normal supported Windows components only. It has no .NET, Python, Java, Node.js, WebView2, Edge, Chromium, Electron, or PowerShell requirement for core functionality.

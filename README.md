@@ -18,6 +18,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 - Optional embedded PowerShell Assist with PowerShell 7, Windows PowerShell compatibility, or Rust-only mode.
 - Optional metadata-only `Roblox\LocalStorage` change tracing for shared-login investigation; no file contents or credentials are read.
 - Sanitized diagnostics, no telemetry, no credentials, no injection, and no administrator requirement.
+- Portable Rust self-updater architecture for GitHub Releases: quiet checks, explicit user approval, SHA-256 verification, same-binary helper replacement, and no installer/service/admin requirement. Repository coordinates are intentionally not configured yet, so this build remains dormant.
 
 ## Architecture
 
@@ -51,7 +52,7 @@ The release executable uses the Windows GUI subsystem and statically links the M
 
 ## Local data
 
-The application owns an explicit, small persistence layer under `%LOCALAPPDATA%\RobloxMultiAccountLauncher` for harmless settings, sanitized logs, per-client junction aliases, and user-requested metadata-only local-state traces. Set `RMAL_DATA_DIR` for controlled development/testing; the repository build and tests use a project-contained `.tmp` location. Multi-account state, Roblox cookies, credentials, authentication tickets, launch tokens, private-server parameters, and file contents are never persisted.
+The application owns an explicit, small persistence layer under `%LOCALAPPDATA%\RobloxMultiAccountLauncher` for harmless settings, sanitized logs, per-client junction aliases, user-requested metadata-only local-state traces, and verified update staging under `Updates`. Set `RMAL_DATA_DIR` for controlled development/testing; the repository build and tests use a project-contained `.tmp` location. Multi-account state, Roblox cookies, credentials, authentication tickets, launch tokens, private-server parameters, and file contents are never persisted.
 
 `eframe`'s generic persistence is deliberately disabled so there is one auditable application-owned settings format.
 
@@ -67,6 +68,14 @@ Invocations use no profile, no interactive terminal, captured output/error, a hi
 
 The known-good V1 PowerShell helper remains preserved under `legacy\powershell`.
 
+## Portable updates
+
+The Settings page contains update preferences and compact About/update status. The installed version comes only from `Cargo.toml`. Automatic checks default on, run after startup without blocking the GUI, and never install silently. Public releases require `RobloxMultiAccountLauncher.exe` plus `update-manifest.json`; the manifest must identify the same version/filename and contain the executable SHA-256 hash.
+
+The updater targets the exact portable executable that is running. After explicit approval, it stages and verifies the release under `%LOCALAPPDATA%\RobloxMultiAccountLauncher\Updates`, starts a temporary copy of the same Rust executable in hidden helper mode, exits, replaces the original with rollback protection, restarts it, and removes owned staging/backup/helper files. It will not begin replacement while multi-account protection or Roblox clients are active.
+
+No GitHub owner/repository is configured in this build. The UI therefore reports **Update status: Not configured**, performs no requests, and does not nag. See [docs/UPDATER.md](docs/UPDATER.md) for the future release contract and deferred signed-manifest requirement.
+
 ## Security and privacy
 
 The launcher is an external process/window manager. It does not read cookie contents, inspect Roblox process memory, inject, hook, patch binaries, modify authentication data, bypass anti-cheat, automate gameplay, elevate, or transmit telemetry. See [SECURITY.md](SECURITY.md).
@@ -81,6 +90,7 @@ The launcher is an external process/window manager. It does not read cookie cont
 - Per-instance path isolation is implemented and fixture-tested, but the final in-launcher Client 1 → Client 2 test is still required. It is not claimed fixed until that succeeds.
 - Login-state behavior is experimental/manual-validation-specific; no separate auth-state lock or credential handling was added and the exact causal local file remains unidentified.
 - Real three-client, post-update, tray, and multi-monitor behavior still require manual validation.
+- GitHub update checking and real portable self-replacement require a future public repository/release and manual validation. SHA-256 is mandatory; cryptographically signed manifests remain a required pre-public-release hardening step.
 
 ## License
 
