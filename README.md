@@ -1,70 +1,84 @@
 # Roblox Multi-Account Launcher
 
-A local Windows launcher and process manager for Roblox with optional multi-account support. It provides backend detection for Fishstrap, Bloxstrap, and stock Roblox; client window controls; diagnostics; and an opt-in implementation of the known-working Roblox multi-instance and teleport-protection handles.
+A portable Windows launcher and client manager implemented in Rust. The application uses native Windows APIs for all critical behavior and an `egui`/`eframe` desktop interface with no browser engine.
 
 This is an independent community project. It is not affiliated with or endorsed by Roblox Corporation, Fishstrap, or Bloxstrap. Roblox does not officially support this multi-instance behavior, and platform behavior may change.
 
-## Features
+## Highlights
 
-- Native C# / WPF dark interface with no console window.
-- Multi-account mode always starts **off** and never persists as enabled.
+- One clear **Launch Roblox** action. In normal mode it launches Roblox normally; in multi-account mode each click prepares another client.
+- Multi-account mode always starts **off** and is never persisted.
+- Multi-instance mechanism: one Rust owner thread holds mutex objects named `ROBLOX_singletonMutex` and `ROBLOX_singletonEvent`; teleport protection separately holds an exclusive, read-only handle to `RobloxCookies.dat`.
+- Launch confirmation snapshots existing clients and requires a genuinely new `RobloxPlayerBeta.exe` PID to remain alive for a short stability window.
 - Auto backend priority: Fishstrap, Bloxstrap, then stock Roblox.
-- Read-only inspection of `roblox:` and `roblox-player:` protocol handlers.
-- Fishstrap and Bloxstrap version, path, folder, log, and protocol-owner diagnostics.
-- Process-based Roblox client list with PID, uptime, memory, window title, focus, graceful close, and approved force-close.
-- Two-client 50/50, 70/30, and vertical layouts; swap and preferred-monitor movement.
-- Optional `Ctrl+Alt+1` / `Ctrl+Alt+2` focus hotkeys using normal Windows hotkey registration.
-- Notification-area controls and protection-aware exit behavior.
-- Local rotating logs, recent activity, safe recovery checks, and sanitized copied diagnostics.
-- No telemetry, accounts, stored credentials, browser runtime, injection, memory access, or administrator requirement.
-
-## Multi-account mechanism
-
-When explicitly enabled, a dedicated resource-owner thread:
-
-1. owns the named mutex `ROBLOX_singletonMutex`;
-2. opens `%LOCALAPPDATA%\Roblox\LocalStorage\RobloxCookies.dat` with `FileMode.Open`, `FileAccess.Read`, and `FileShare.None`.
-
-The application never reads, parses, copies, prints, modifies, or deletes cookie contents. The file handle exists only to preserve the previously validated teleport behavior.
-
-## Build
-
-Requirements:
-
-- Windows 10/11 x64
-- .NET 10 SDK
-
-```powershell
-dotnet restore .\RobloxMultiAccountLauncher.sln --configfile .\NuGet.Config
-dotnet build .\RobloxMultiAccountLauncher.sln -c Release --no-restore
-dotnet run --project .\tests\RobloxMultiAccountLauncher.Tests -c Release --no-build
-dotnet publish .\src\RobloxMultiAccountLauncher\RobloxMultiAccountLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
-```
-
-The application project uses `OutputType=WinExe`; normal operation does not start PowerShell, CMD, or a console backend.
+- Read-only `roblox:` and `roblox-player:` protocol inspection.
+- Client list with PID, uptime, RAM, window title, focus, graceful close, confirmed force close, and two-client layouts.
+- Protection-aware tray lifecycle.
+- Optional embedded PowerShell Assist with PowerShell 7, Windows PowerShell compatibility, or Rust-only mode.
+- Optional metadata-only `Roblox\LocalStorage` change tracing for shared-login investigation; no file contents or credentials are read.
+- Sanitized diagnostics, no telemetry, no credentials, no injection, and no administrator requirement.
 
 ## Architecture
 
-- `Models`: launcher, client, settings, state, and protection types.
-- `Services`: resource ownership, backend detection, launching/queueing, process management, layouts, settings, logging, diagnostics, tray/hotkey support.
-- `Themes`: reusable dark WPF resources.
-- `legacy/powershell`: preserved known-good V1 implementation.
-- `tests`: dependency-free automated validation executable using fixtures and test-only mutex names.
+Rust is authoritative for lifecycle, single-instance state, protection handles, process tracking, launching, queueing, backend detection, window management, settings, tray behavior, logging, and failures. PowerShell is an optional diagnostic assistant and never owns critical runtime state.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/MANUAL-TESTING.md](docs/MANUAL-TESTING.md).
+The GUI uses `egui`/`eframe` because it compiles into the executable, provides DPI-aware responsive rendering, requires no WebView/.NET/browser runtime, and supports a controlled high-contrast dark theme.
 
-## Privacy and security
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Everything remains local. The launcher does not store Roblox credentials or cookies, inspect process memory, intercept network traffic, upload logs, or collect analytics. Copied diagnostics are redacted for common ticket, token, cookie, bearer, and private-server values. See [SECURITY.md](SECURITY.md).
+Shared-login investigation and its current unsupported status are documented in [docs/LOGIN-STATE-INVESTIGATION.md](docs/LOGIN-STATE-INVESTIGATION.md).
+
+## Build
+
+Build requirements only:
+
+- Windows 10/11 x64
+- Rust 1.94 or newer with the `x86_64-pc-windows-msvc` target
+- MSVC linker/build tools
+
+```powershell
+.\build-release.ps1
+```
+
+The script keeps Cargo caches and target output under `.tmp` and copies the validated executable to:
+
+```text
+dist\RobloxMultiAccountLauncher.exe
+```
+
+The release executable uses the Windows GUI subsystem and statically links the MSVC CRT. End users do not need Rust, Visual Studio, .NET, PowerShell 7, Python, Java, Node, WebView2, or a browser runtime.
+
+## Local data
+
+The application owns an explicit, small persistence layer under `%LOCALAPPDATA%\RobloxMultiAccountLauncher` for harmless settings, sanitized logs, and user-requested metadata-only local-state traces. Set `RMAL_DATA_DIR` for controlled development/testing; the repository build and tests use a project-contained `.tmp` location. Multi-account state, Roblox cookies, credentials, authentication tickets, launch tokens, private-server parameters, and file contents are never persisted.
+
+`eframe`'s generic persistence is deliberately disabled so there is one auditable application-owned settings format.
+
+## PowerShell Assist
+
+Auditable source scripts live in `scripts` and are embedded into the Rust executable at compile time. Engine order:
+
+1. PowerShell 7 (`pwsh.exe`) — Full
+2. Windows PowerShell 5.1 (`powershell.exe`) — Compatibility
+3. No engine — Rust-only mode
+
+Invocations use no profile, no interactive terminal, captured output/error, a hidden process, cancellation, and bounded timeouts. Diagnostic scripts are read-only. Repair inspection returns proposed actions; mutation requires a separate explicit GUI confirmation.
+
+The known-good V1 PowerShell helper remains preserved under `legacy\powershell`.
+
+## Security and privacy
+
+The launcher is an external process/window manager. It does not read cookie contents, inspect Roblox process memory, inject, hook, patch binaries, modify authentication data, bypass anti-cheat, automate gameplay, elevate, or transmit telemetry. See [SECURITY.md](SECURITY.md).
 
 ## Current limitations
 
-- All V2 behavior needs real-world manual validation; automated tests do not launch Roblox.
-- Launcher command-line behavior can change in future Fishstrap, Bloxstrap, or Roblox versions.
-- High-level log analysis is best-effort and intentionally avoids brittle exact-message parsing.
-- Two-client tiling is the primary layout; more than two clients are listed and managed but not automatically gridded.
-- A neutral system placeholder icon is used; original branding remains TODO.
-- Graceful close depends on a Roblox window accepting the standard Windows close request.
+- Roblox/Fishstrap/Bloxstrap command-line and protocol behavior can change.
+- File-version display is best-effort and may show `Unknown`.
+- Two-client layouts are primary; additional clients remain individually manageable.
+- Graceful close depends on a Roblox window accepting `WM_CLOSE`.
+- Current Roblox singleton behavior is undocumented and can change. Holding both names is implemented and unit-tested, but real two/three-client validation is still required.
+- Concurrent Roblox desktop clients under one Windows profile may share local login state. Login-state isolation is currently unsupported; the launcher provides metadata-only tracing to identify candidate state files without reading them.
+- Real multi-client, teleport, shared-logout, tray, and multi-monitor behavior require manual validation.
 
 ## License
 

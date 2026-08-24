@@ -1,13 +1,6 @@
-bin/
-obj/
+.tmp/
+target/
+dist/
 .vs/
 .idea/
-TestResults/
-artifacts/
-publish/
-*.user
-*.suo
-*.nupkg
-*.snupkg
 *.log
-src/RobloxMultiAccountLauncher/appsettings.local.json

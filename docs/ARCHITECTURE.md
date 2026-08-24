@@ -1,39 +1,63 @@
 # Architecture
 
-The application is a dependency-light .NET 10 Windows desktop utility.
+## Runtime core
 
-## Lifecycle
+The application is a Rust 2024 Windows desktop program. `egui`/`eframe` owns rendering and DPI-aware layout; `windows-sys` calls native Win32 APIs.
 
-`App` acquires `Wolfy_RobloxMultiAccountLauncher` before constructing the main window. A second process signals the primary process and exits before any Roblox or protection action.
+Critical state is never delegated to PowerShell:
 
-The initial state is always `Normal`. Multi-account state is intentionally absent from persisted settings.
+- `AppInstanceGuard` owns `Wolfy_RobloxMultiAccountLauncher`.
+- `ProtectionController` owns a dedicated resource thread.
+- That thread owns native mutex objects named `ROBLOX_singletonMutex` and `ROBLOX_singletonEvent`, plus the exclusive read-only cookie-file handle.
+- The `ROBLOX_singletonEvent` name is deliberately occupied by a mutex rather than a Win32 event. Named synchronization objects share one session-local `BaseNamedObjects` namespace; this prevents Roblox from creating its event while retaining the proven mutex-ownership model.
+- RAII drops only handles actually acquired, on the owner thread.
+- The two singleton names are acquired all-or-nothing. Partial acquisition drops the first handle before reporting a recoverable setup failure. Cookie-lock failure retains both singleton guards as a separate teleport Warning state.
+- Atomic health bits let the launch monitor verify both singleton handles before backend start and throughout bootstrap without moving ownership away from the resource thread.
+- GUI code receives typed channel events; failures remain inside the running application.
 
-## Resource ownership
+## Previous C# failure investigation
 
-`MultiAccountService` uses a dedicated background resource thread. Mutex acquisition, retention, release, and `FileStream` disposal all occur on that same thread, respecting the thread-affine semantics of `System.Threading.Mutex` without blocking WPF.
+The previous launcher log records successful mutex and cookie acquisition, two successful Fishstrap launch detections, and then stops without the normal shutdown-cleanup entry. No exception, stack trace, or definitive crash cause was recorded.
 
-Preparation and cancellation either retain a complete usable state or clean up acquired resources. A cookie-lock failure produces a warning while keeping the successfully acquired Roblox mutex.
+The C# implementation already tried to respect thread-affine mutex ownership with a dedicated thread, but its GUI used several `async void` event paths and a dispatcher timer while shutdown/resource disposal could occur. An unobserved UI-event exception or lifecycle race is plausible, but not proven. The Rust migration avoids blindly porting that lifecycle: critical handles live in one owner loop, cleanup is RAII, UI/background communication is channel-based, and every setup result becomes a recoverable UI state.
 
 ## Launching
 
-`LauncherDetectionService` inspects executable files and protocol registrations read-only. Auto selection prefers Fishstrap, then Bloxstrap, then stock Roblox. Explicit selections never silently fall back.
+`LaunchManager` atomically rejects overlapping bootstraps. It snapshots current Roblox PIDs, verifies both singleton guards when multi-account mode is active, launches the selected backend using `ShellExecuteExW`, and waits with a bounded timeout for a genuinely new `RobloxPlayerBeta.exe` PID. A candidate must remain alive for two seconds before success. Existing clients cannot be mistaken for the new client.
 
-`LaunchQueue` rejects overlapping bootstrap work. `LaunchService` watches only normal process enumeration for a new `RobloxPlayerBeta` PID and uses a bounded timeout. It never reads process memory.
+Launch diagnostics distinguish backend-start failure, backend start with no new player PID, transient/replaced player PIDs, observed Roblox launcher/installer processes, existing clients that close during bootstrap, and protection loss. Fishstrap/Bloxstrap process creation alone is never treated as Roblox launch success.
 
-## Client windows
+Auto resolves Fishstrap → Bloxstrap → stock Roblox. Detection requires a real executable, using known locations and valid protocol ownership. Manual selections do not silently rewrite settings.
 
-`RobloxProcessService` exposes safe process/window metadata. `WindowManager` uses standard User32 window positioning/focus calls and monitor work areas. Global focus shortcuts use `RegisterHotKey`, not keyboard hooks.
+## Windows integration
 
-## Local data
+Native APIs implement:
 
-Harmless settings and rotated launcher logs live below `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. No multi-account enabled flag, credential, cookie, launch URI, or telemetry is stored.
+- named mutexes and exclusive file handles;
+- Tool Help process enumeration and safe process metadata;
+- read-only registry/protocol inspection;
+- `WM_CLOSE`, bounded exit checks, confirmed `TerminateProcess`;
+- window focus and positioning;
+- monitor work-area enumeration and 50/50, 70/30, vertical, and swapped layouts;
+- shell launch/open behavior;
+- existing-window activation;
+- notification-area menu integration.
+- metadata-only `ReadDirectoryChangesW` tracing under `Roblox\LocalStorage`.
 
-## Deliberately rejected approaches
+No injection, hooks, memory-content reads, registry writes, protocol rewrites, or elevation are used.
 
-- DLL injection, hooks, memory access, memory scanning, process hiding, kernel drivers, anti-cheat manipulation, hardware spoofing, or binary replacement.
-- Credential/cookie-based account management or account-to-process mapping.
-- WebView2, Edge, Chromium, Electron, browser UI, cloud services, telemetry, and analytics.
-- Registry writes or protocol reassociation during routine launching.
-- Hard-coded Roblox version directories as the primary launch mechanism.
-- Automatic killing of RobloxCrashHandler or unrelated/stale-looking processes without confirmation.
-- Automatic restart or anti-closure loops when a Roblox client exits.
+## Shared desktop login state
+
+Roblox desktop clients under the same Windows user profile can observe shared local login state. The launcher does not store accounts, credentials, `.ROBLOSECURITY`, authentication tickets, or cookies, and it does not attempt to restore stale authentication state.
+
+Login-state isolation is currently **unsupported / not enabled**. The Diagnostics page can start an explicit metadata-only trace of `%LOCALAPPDATA%\Roblox\LocalStorage`. The trace records relative file path, timestamp, create/write/delete/rename action, and `process=unavailable`; Windows directory notifications do not identify the writer. It never opens or reads the changed files. No candidate file is locked until manual evidence identifies a narrow state file and separate validation proves that locking it is safe.
+
+## PowerShell Assist
+
+Readable scripts remain in `scripts` and compile into the binary with `include_str!`. Rust detects PS7, then Windows PowerShell, then uses Rust-only mode. Child processes use `CREATE_NO_WINDOW`, redirected streams, no profile, no interaction, timeouts, cancellation, and forced child cleanup after timeout.
+
+Scripts return JSON. Diagnostic scripts are read-only. The repair script reports proposed actions only.
+
+## Data
+
+Runtime data defaults to `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. `RMAL_DATA_DIR` redirects development/test data to project-contained `.tmp`. The application owns this persistence explicitly; generic `eframe` persistence is disabled. Multi-account mode is absent from the settings schema and always initializes disabled.
