@@ -1,20 +1,27 @@
 # Manual testing checklist
 
-Automated checks do not launch/close Roblox, touch the real `RobloxCookies.dat`, modify the registry, mutate Fishstrap/Bloxstrap, or perform account login/logout. The tests below are **not completed** until Wolfy performs them.
+Automated checks do not launch/close Roblox, touch the real `RobloxCookies.dat`, modify the registry, mutate Fishstrap/Bloxstrap, or perform account login/logout. Results below record Wolfy's repeated manual validation separately from the remaining per-instance launch test.
 
-## A. Multi-instance (required)
+## A. Multi-instance
+
+**Validated externally:** two clients coexist while the Rust protections are active. Repeatedly opening the same exact Roblox executable path does not create Client 2.
+
+**Still required for per-instance path isolation:**
 
 1. Start `dist\RobloxMultiAccountLauncher.exe` before Roblox.
 2. Enable Multi-Account Mode and wait until Diagnostics shows:
-   - `singletonMutex: HELD`
-   - `singletonEvent compatibility mutex: HELD`
+   - `Shared singleton mutex: HELD`
+   - `Shared singleton event: HELD`
+   - `Per-instance path isolation: READY`
 3. Launch Client 1 with the single **Launch Roblox** action.
 4. Launch Client 2 with the same action.
 5. Verify both clients remain open and the launcher reports a genuinely new stable PID for each launch.
 6. Optionally launch Client 3.
 7. Verify no existing client closes. If one does, capture Diagnostics and note whether an installer/update process was reported.
 
-## B. Teleport (required)
+## B. Teleport
+
+**Passed:** two differently authenticated clients survived a real multi-client teleport. Repeat after the first successful in-launcher Client 2 launch to validate the combined path-isolation flow.
 
 1. Confirm Teleport protection shows **Protected**.
 2. Run two differently authenticated clients.
@@ -22,15 +29,18 @@ Automated checks do not launch/close Roblox, touch the real `RobloxCookies.dat`,
 4. Perform an actual cross-place or cross-server teleport.
 5. Verify both clients survive and remain usable.
 
-## C. Shared logout (required; not claimed fixed)
+## C. Shared logout
+
+**Passed three times, bidirectionally:** logging out Client 1 did not log out Client 2, and logging out Client 2 did not log out Client 1, while the external protections were active.
 
 1. Run two differently authenticated clients.
 2. Log out from Client 2.
 3. Observe Client 1 while it remains inside an experience.
 4. Leave Client 1's experience and return to the Roblox desktop app.
-5. Verify whether Client 1 remains authenticated.
+5. Verify Client 1 remains authenticated.
+6. Repeat in the other direction.
 
-Current expected product status is **Login-state isolation: Unsupported / not enabled**. Do not mark this issue fixed unless this test passes after a specifically validated, narrow protection mechanism is implemented.
+Current product status is **Experimental / manually validated**. No separate auth-state file protection or credential handling is claimed.
 
 ## D. Metadata-only logout investigation
 

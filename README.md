@@ -7,6 +7,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 ## Highlights
 
 - One clear **Launch Roblox** action. In normal mode it launches Roblox normally; in multi-account mode each click prepares another client.
+- Multi-account launches use native NTFS junctions under `%LOCALAPPDATA%\RobloxMultiAccountLauncher\Instances\Client-NNNN` so every client is started through a unique path without copying or modifying Roblox files.
 - Multi-account mode always starts **off** and is never persisted.
 - Multi-instance mechanism: one Rust owner thread holds mutex objects named `ROBLOX_singletonMutex` and `ROBLOX_singletonEvent`; teleport protection separately holds an exclusive, read-only handle to `RobloxCookies.dat`.
 - Launch confirmation snapshots existing clients and requires a genuinely new `RobloxPlayerBeta.exe` PID to remain alive for a short stability window.
@@ -26,7 +27,7 @@ The GUI uses `egui`/`eframe` because it compiles into the executable, provides D
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Shared-login investigation and its current unsupported status are documented in [docs/LOGIN-STATE-INVESTIGATION.md](docs/LOGIN-STATE-INVESTIGATION.md).
+Shared-login investigation and its current experimental/manual-validation status are documented in [docs/LOGIN-STATE-INVESTIGATION.md](docs/LOGIN-STATE-INVESTIGATION.md).
 
 ## Build
 
@@ -50,7 +51,7 @@ The release executable uses the Windows GUI subsystem and statically links the M
 
 ## Local data
 
-The application owns an explicit, small persistence layer under `%LOCALAPPDATA%\RobloxMultiAccountLauncher` for harmless settings, sanitized logs, and user-requested metadata-only local-state traces. Set `RMAL_DATA_DIR` for controlled development/testing; the repository build and tests use a project-contained `.tmp` location. Multi-account state, Roblox cookies, credentials, authentication tickets, launch tokens, private-server parameters, and file contents are never persisted.
+The application owns an explicit, small persistence layer under `%LOCALAPPDATA%\RobloxMultiAccountLauncher` for harmless settings, sanitized logs, per-client junction aliases, and user-requested metadata-only local-state traces. Set `RMAL_DATA_DIR` for controlled development/testing; the repository build and tests use a project-contained `.tmp` location. Multi-account state, Roblox cookies, credentials, authentication tickets, launch tokens, private-server parameters, and file contents are never persisted.
 
 `eframe`'s generic persistence is deliberately disabled so there is one auditable application-owned settings format.
 
@@ -76,9 +77,10 @@ The launcher is an external process/window manager. It does not read cookie cont
 - File-version display is best-effort and may show `Unknown`.
 - Two-client layouts are primary; additional clients remain individually manageable.
 - Graceful close depends on a Roblox window accepting `WM_CLOSE`.
-- Current Roblox singleton behavior is undocumented and can change. Holding both names is implemented and unit-tested, but real two/three-client validation is still required.
-- Concurrent Roblox desktop clients under one Windows profile may share local login state. Login-state isolation is currently unsupported; the launcher provides metadata-only tracing to identify candidate state files without reading them.
-- Real multi-client, teleport, shared-logout, tray, and multi-monitor behavior require manual validation.
+- Holding both singleton names, two-client coexistence, teleporting, and bidirectional logout behavior have been manually validated three times on the validation machine. Roblox behavior remains undocumented and can change.
+- Per-instance path isolation is implemented and fixture-tested, but the final in-launcher Client 1 → Client 2 test is still required. It is not claimed fixed until that succeeds.
+- Login-state behavior is experimental/manual-validation-specific; no separate auth-state lock or credential handling was added and the exact causal local file remains unidentified.
+- Real three-client, post-update, tray, and multi-monitor behavior still require manual validation.
 
 ## License
 

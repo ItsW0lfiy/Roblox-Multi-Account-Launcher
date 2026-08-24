@@ -1,4 +1,5 @@
 use crate::{
+    instance_paths::InstanceRecord,
     model::{Detection, LaunchBackend, ProtectionState, RobloxClient},
     powershell::PowerShellInfo,
 };
@@ -23,20 +24,67 @@ pub fn redact(text: &str) -> String {
         .into_owned()
 }
 
-pub fn report(
-    detection: &Detection,
-    selected: LaunchBackend,
-    clients: &[RobloxClient],
-    protection: ProtectionState,
-    singleton_mutex_held: bool,
-    singleton_event_held: bool,
-    cookie_locked: bool,
-    powershell: &PowerShellInfo,
-    recent_error: Option<&str>,
-) -> String {
+pub struct ReportContext<'a> {
+    pub detection: &'a Detection,
+    pub selected: LaunchBackend,
+    pub clients: &'a [RobloxClient],
+    pub protection: ProtectionState,
+    pub singleton_mutex_held: bool,
+    pub singleton_event_held: bool,
+    pub cookie_locked: bool,
+    pub isolated_instances: &'a [InstanceRecord],
+    pub path_isolation_error: Option<&'a str>,
+    pub powershell: &'a PowerShellInfo,
+    pub recent_error: Option<&'a str>,
+}
+
+pub fn report(context: ReportContext<'_>) -> String {
+    let ReportContext {
+        detection,
+        selected,
+        clients,
+        protection,
+        singleton_mutex_held,
+        singleton_event_held,
+        cookie_locked,
+        isolated_instances,
+        path_isolation_error,
+        powershell,
+        recent_error,
+    } = context;
     let resolved = detection.resolve(selected);
+    let path_state = if protection == ProtectionState::Disabled {
+        "DISABLED"
+    } else if path_isolation_error.is_some() {
+        "WARNING"
+    } else if isolated_instances.is_empty() {
+        "READY"
+    } else {
+        "ACTIVE"
+    };
+    let instance_details = if isolated_instances.is_empty() {
+        "No isolated client paths allocated in this launcher session.".into()
+    } else {
+        isolated_instances
+            .iter()
+            .map(|instance| {
+                format!(
+                    "Client-{:04}\n  PID: {}\n  Launch path: isolated\n  Alias: {}\n  Backend: {}\n  Version: {}\n  Target: {}",
+                    instance.client_id,
+                    instance
+                        .pid
+                        .map_or_else(|| "Pending / unconfirmed".into(), |pid| pid.to_string()),
+                    instance.alias_path.display(),
+                    instance.backend.label(),
+                    instance.version,
+                    instance.target_version.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     redact(&format!(
-        "Roblox Multi-Account Launcher\nVersion: {}\nArchitecture: Rust + egui/eframe + native Windows APIs\nMode: {}\n\nROBLOX\nInstalled: {}\nProcesses: {}\n{}: owner: {} ({}, registered: {})\n{}: owner: {} ({}, registered: {})\n\nFISHSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nBLOXSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nLAUNCH BACKEND\nSelected: {}\nResolved: {}\n\nMULTI-ACCOUNT\nApplication mutex: Owned\nsingletonMutex: {}\nsingletonEvent compatibility mutex: {}\nCookie file: {}\nTeleport cookie lock: {}\nMulti-instance protection: {}\nLogin-state isolation: Unsupported / not enabled\nLogin-state note: Desktop clients under one Windows profile may share local login state.\n\nPOWERSHELL ASSIST\nEngine: {}\nVersion: {}\nStatus: {}\n\nRecent error: {}",
+        "Roblox Multi-Account Launcher\nVersion: {}\nArchitecture: Rust + egui/eframe + native Windows APIs\nMode: {}\n\nROBLOX\nInstalled: {}\nProcesses: {}\n{}: owner: {} ({}, registered: {})\n{}: owner: {} ({}, registered: {})\n\nFISHSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nBLOXSTRAP\nDetected: {}\nVersion: {}\nExecutable: {}\n\nLAUNCH BACKEND\nSelected: {}\nResolved: {}\n\nMULTI-ACCOUNT\nApplication mutex: Owned\nShared singleton mutex: {}\nShared singleton event: {}\nCookie file: {}\nTeleport/login protection: {}\nMulti-instance protection: {}\nPer-instance path isolation: {}\nPath-isolation root: {}\nPath-isolation error: {}\nLogin-state behavior: Experimental / manually validated\n\nISOLATED CLIENT PATHS\n{}\n\nPOWERSHELL ASSIST\nEngine: {}\nVersion: {}\nStatus: {}\n\nRecent error: {}",
         env!("CARGO_PKG_VERSION"),
         if protection == ProtectionState::Disabled {
             "Normal"
@@ -88,8 +136,12 @@ pub fn report(
             "NOT HELD"
         },
         crate::platform::cookie_path().is_file(),
-        if cookie_locked { "Owned" } else { "Not owned" },
+        if cookie_locked { "HELD" } else { "NOT HELD" },
         protection.label(),
+        path_state,
+        crate::settings::data_root().join("Instances").display(),
+        path_isolation_error.unwrap_or("None"),
+        instance_details,
         powershell.engine_label(),
         powershell.version.as_deref().unwrap_or("Unknown"),
         powershell.capability(),

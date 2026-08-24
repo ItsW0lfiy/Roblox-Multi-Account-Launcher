@@ -1,5 +1,6 @@
 use crate::{
     diagnostics,
+    instance_paths::InstancePathManager,
     launch::{LaunchEvent, LaunchManager},
     local_state::{LocalStateTracer, TraceEvent},
     model::{
@@ -11,6 +12,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::{
+    collections::HashSet,
     sync::{Arc, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant, SystemTime},
@@ -72,6 +74,8 @@ pub struct LauncherApp {
     singleton_mutex_held: bool,
     singleton_event_held: bool,
     cookie_locked: bool,
+    instance_paths: InstancePathManager,
+    path_isolation_error: Option<String>,
     launch: LaunchManager,
     detection: Detection,
     clients: Vec<RobloxClient>,
@@ -130,6 +134,7 @@ impl LauncherApp {
         };
         let (tray, tray_ids) = build_tray();
         let clients = platform::enumerate_clients();
+        let instance_paths = InstancePathManager::new(root.join("Instances"), !clients.is_empty());
         Self {
             _instance_guard: instance_guard,
             protection: ProtectionController::new("ROBLOX_singletonMutex", "ROBLOX_singletonEvent"),
@@ -137,6 +142,8 @@ impl LauncherApp {
             singleton_mutex_held: false,
             singleton_event_held: false,
             cookie_locked: false,
+            instance_paths,
+            path_isolation_error: None,
             launch: LaunchManager::new(),
             detection: platform::detect_launchers(None),
             previous_pids: clients.iter().map(|client| client.pid).collect(),
@@ -211,6 +218,16 @@ impl LauncherApp {
         }
         self.previous_pids = current.iter().map(|client| client.pid).collect();
         self.clients = current;
+        if !self.launch.busy() {
+            let running: HashSet<u32> = self.clients.iter().map(|client| client.pid).collect();
+            for message in self.instance_paths.cleanup_exited(&running) {
+                let error = message.starts_with("Could not");
+                if error {
+                    self.path_isolation_error = Some(message.clone());
+                }
+                self.add_activity(message, error);
+            }
+        }
     }
 
     fn refresh_detection(&mut self) {
@@ -299,17 +316,45 @@ impl LauncherApp {
             ProtectionState::Protected | ProtectionState::Warning
         )
         .then(|| self.protection.health());
+        let isolated_launch = if required_protection.is_some() {
+            match self
+                .instance_paths
+                .allocate(&self.detection, self.settings.backend)
+            {
+                Ok(launch) => {
+                    self.path_isolation_error = None;
+                    Some(launch)
+                }
+                Err(message) => {
+                    self.path_isolation_error = Some(message.clone());
+                    self.status = format!("Per-instance path setup failed: {message}");
+                    self.recent_error = Some(message.clone());
+                    self.add_activity(self.status.clone(), true);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let allocated_id = isolated_launch.as_ref().map(|launch| launch.client_id);
         match self.launch.begin(
             self.detection.clone(),
             self.settings.backend,
             Duration::from_secs(self.settings.launch_timeout_seconds),
             required_protection,
+            isolated_launch,
         ) {
             Ok(()) => {
                 self.launch_text = "Preparing launch…".into();
                 self.status = "Preparing Roblox launch…".into();
             }
             Err(message) => {
+                if let Some(client_id) = allocated_id
+                    && let Err(cleanup) = self.instance_paths.discard_unlaunched(client_id)
+                {
+                    self.path_isolation_error = Some(cleanup.clone());
+                    self.add_activity(cleanup, true);
+                }
                 self.status = message.clone();
                 self.recent_error = Some(message);
             }
@@ -460,14 +505,21 @@ impl LauncherApp {
                     backend,
                     detail,
                     warning,
+                    isolation,
                 } => {
+                    if let Some(isolation) = isolation {
+                        self.instance_paths.bind_pid(isolation.client_id, pid);
+                    }
                     self.launch_text = "Roblox launched".into();
                     self.status = format!(
                         "New Roblox client confirmed through {backend} (PID {pid}). {detail}"
                     );
                     self.add_activity(self.status.clone(), warning);
                 }
-                LaunchEvent::Failed(message) => {
+                LaunchEvent::Failed { message, isolation } => {
+                    if let Some(isolation) = isolation {
+                        self.instance_paths.mark_unconfirmed(isolation.client_id);
+                    }
                     self.launch_text = "Launch failed".into();
                     self.status = format!("Launch failed: {message}");
                     self.recent_error = Some(message.clone());
@@ -507,10 +559,9 @@ impl LauncherApp {
         if !self.launch.busy()
             && self.launch_text != "Launch Roblox"
             && !self.launch_text.ends_with('…')
+            && self.last_refresh.elapsed() > Duration::from_secs(1)
         {
-            if self.last_refresh.elapsed() > Duration::from_secs(1) {
-                self.launch_text = "Launch Roblox".into();
-            }
+            self.launch_text = "Launch Roblox".into();
         }
         while let Ok(event) = self.close_rx.try_recv() {
             match event {
@@ -753,12 +804,14 @@ impl LauncherApp {
                 state_row(ui, "singletonMutex", if self.singleton_mutex_held { "HELD" } else { "Not held" }, if self.singleton_mutex_held { ProtectionState::Protected } else { ProtectionState::Disabled });
                 state_row(ui, "singletonEvent", if self.singleton_event_held { "HELD" } else { "Not held" }, if self.singleton_event_held { ProtectionState::Protected } else { ProtectionState::Disabled });
                 state_row(ui, "Teleport protection", if self.cookie_locked { "Protected" } else if self.protection_state == ProtectionState::Warning { "Warning" } else { "Disabled" }, if self.cookie_locked { ProtectionState::Protected } else { self.protection_state });
-                state_row(ui, "Login-state isolation", "Unsupported", ProtectionState::Warning);
+                let path_state = if self.path_isolation_error.is_some() { ProtectionState::Warning } else if self.protection_state == ProtectionState::Disabled { ProtectionState::Disabled } else { ProtectionState::Protected };
+                let path_label = if self.path_isolation_error.is_some() { "Warning" } else if self.protection_state == ProtectionState::Disabled { "Disabled" } else if self.instance_paths.records().is_empty() { "Ready" } else { "ACTIVE" };
+                state_row(ui, "Per-instance path isolation", path_label, path_state);
+                state_row(ui, "Login-state behavior", "Experimental / manually validated", ProtectionState::Warning);
                 if self.protection_state == ProtectionState::Warning { ui.colored_label(Color32::from_rgb(230, 176, 70), "Multiple clients may launch, but multi-client teleports may fail."); }
-                if matches!(self.protection_state, ProtectionState::Lost | ProtectionState::Disabled) && self.recent_error.is_some() {
-                    if ui.button("Retry Multi-Account Setup").clicked() {
-                        if self.clients.is_empty() { self.begin_enable(); } else { self.dialog = Some(Dialog::EnableWithClients(self.clients.iter().map(|client| client.pid).collect())); }
-                    }
+                if matches!(self.protection_state, ProtectionState::Lost | ProtectionState::Disabled) && self.recent_error.is_some()
+                    && ui.button("Retry Multi-Account Setup").clicked() {
+                    if self.clients.is_empty() { self.begin_enable(); } else { self.dialog = Some(Dialog::EnableWithClients(self.clients.iter().map(|client| client.pid).collect())); }
                 }
             });
             card(&mut columns[1], "Launch Backend", |ui| {
@@ -832,6 +885,7 @@ impl LauncherApp {
             );
         }
         for client in self.clients.clone() {
+            let isolated = self.instance_paths.record_for_pid(client.pid).cloned();
             card(
                 ui,
                 &format!("Client {}  •  PID {}", client.number, client.pid),
@@ -842,6 +896,21 @@ impl LauncherApp {
                         client.working_set as f64 / 1_048_576.0,
                         client.title
                     ));
+                    if let Some(record) = &isolated {
+                        ui.label(format!(
+                            "Launch path: isolated Client-{:04}  •  Backend: {}  •  Version: {}",
+                            record.client_id,
+                            record.backend.label(),
+                            record.version
+                        ));
+                        ui.label(
+                            RichText::new(format!("Alias: {}", record.alias_path.display()))
+                                .monospace()
+                                .color(Color32::from_rgb(155, 159, 172)),
+                        );
+                    } else {
+                        ui.label("Launch path: external or normal backend path");
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Focus Client").clicked() {
                             platform::focus_window(client.window);
@@ -898,17 +967,19 @@ impl LauncherApp {
     }
 
     fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
-        let report = diagnostics::report(
-            &self.detection,
-            self.settings.backend,
-            &self.clients,
-            self.protection_state,
-            self.singleton_mutex_held,
-            self.singleton_event_held,
-            self.cookie_locked,
-            &self.powershell,
-            self.recent_error.as_deref(),
-        );
+        let report = diagnostics::report(diagnostics::ReportContext {
+            detection: &self.detection,
+            selected: self.settings.backend,
+            clients: &self.clients,
+            protection: self.protection_state,
+            singleton_mutex_held: self.singleton_mutex_held,
+            singleton_event_held: self.singleton_event_held,
+            cookie_locked: self.cookie_locked,
+            isolated_instances: self.instance_paths.records(),
+            path_isolation_error: self.path_isolation_error.as_deref(),
+            powershell: &self.powershell,
+            recent_error: self.recent_error.as_deref(),
+        });
         ui.horizontal(|ui| {
             ui.heading("Diagnostics");
             if ui.button("Refresh").clicked() {
@@ -932,11 +1003,11 @@ impl LauncherApp {
             ui.heading("Shared login-state investigation");
             state_row(
                 ui,
-                "Login-state isolation",
-                "Unsupported / not enabled",
+                "Login-state behavior",
+                "Experimental / manually validated",
                 ProtectionState::Warning,
             );
-            ui.label("Concurrent Roblox clients share desktop-app login state under the same Windows user profile; full per-client logout isolation is not safely achievable with the current external-only design.");
+            ui.label("Bidirectional logout isolation was manually validated three times with the external protections active. This remains experimental until it is validated across Roblox updates and other Windows profiles.");
             ui.label("No credential, cookie, ticket, or file-content handling is implemented.");
             ui.label("The tracer below records only relative path, time, and create/write/delete/rename metadata under Roblox\\LocalStorage. Windows directory notifications do not identify the responsible process, so process is recorded as unavailable.");
             ui.horizontal(|ui| {
@@ -1293,6 +1364,11 @@ impl eframe::App for LauncherApp {
         self.ps_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.settings_store.save(&self.settings);
+        let running: HashSet<u32> = platform::enumerate_clients()
+            .into_iter()
+            .map(|client| client.pid)
+            .collect();
+        let _ = self.instance_paths.cleanup_exited(&running);
         self.logger.write(
             "INFO",
             "Application shutdown cleanup started; Rust resource owners will now drop.",

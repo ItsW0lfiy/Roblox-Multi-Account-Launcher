@@ -2,9 +2,9 @@
 
 ## Current conclusion
 
-Concurrent Roblox clients share desktop-app login state under the same Windows user profile; full per-client logout isolation is not safely achievable with the current external-only design.
+Bidirectional independent logout behavior has been manually validated three times with two clients while the existing external protections were active. Logging out either client did not log out the other.
 
-No login-state protection is enabled. The launcher does not read, store, copy, restore, or display credentials, `.ROBLOSECURITY`, cookies, authentication tickets, passwords, or private authentication data.
+This result is reported as **Experimental / manually validated**, not universal support. No additional login-state file lock is enabled, and the test does not prove which existing external protection causes the behavior. The launcher does not read, store, copy, restore, or display credentials, `.ROBLOSECURITY`, cookies, authentication tickets, passwords, or private authentication data.
 
 ## Safe metadata inventory
 
@@ -29,6 +29,6 @@ Diagnostics offers **Start Local-State Trace** / **Stop Trace**. The native Rust
 
 ## Protection decision gate
 
-An experimental lock may be considered only after a manual two-client logout trace repeatedly identifies a narrow shared-state file and separate testing shows Roblox tolerates a read-only/exclusive external handle. It must remain off by default until the shared-logout test passes.
+No new auth-state lock is justified by the passing manual result. If a Roblox update regresses logout behavior, an experimental lock may be considered only after a manual two-client trace repeatedly identifies a narrow shared-state file and separate testing shows Roblox tolerates a read-only/exclusive external handle.
 
 The project will not implement account vaults, credential storage, authentication-ticket generation, embedded login browsers, filesystem virtualization, injection, hooks, kernel filters, or stale-token restoration.

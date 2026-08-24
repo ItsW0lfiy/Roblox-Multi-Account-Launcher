@@ -230,7 +230,7 @@ fn parse_changes(
     while offset + 12 <= transferred {
         let info = unsafe { &*(bytes.add(offset).cast::<FILE_NOTIFY_INFORMATION>()) };
         let name_bytes = info.FileNameLength as usize;
-        if offset + 12 + name_bytes > transferred || name_bytes % 2 != 0 {
+        if offset + 12 + name_bytes > transferred || !name_bytes.is_multiple_of(2) {
             return Err("Windows returned an invalid local-state change record.".into());
         }
         let name = unsafe {

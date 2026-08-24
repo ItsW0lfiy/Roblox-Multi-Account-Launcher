@@ -1,4 +1,5 @@
 use crate::{
+    instance_paths::IsolatedLaunch,
     model::{Detection, LaunchBackend},
     platform::{self, ProtectionHealth},
 };
@@ -25,8 +26,12 @@ pub enum LaunchEvent {
         backend: String,
         detail: String,
         warning: bool,
+        isolation: Option<IsolatedLaunch>,
     },
-    Failed(String),
+    Failed {
+        message: String,
+        isolation: Option<IsolatedLaunch>,
+    },
 }
 
 #[derive(Default)]
@@ -207,6 +212,7 @@ impl LaunchManager {
         selected: LaunchBackend,
         timeout: Duration,
         required_protection: Option<ProtectionHealth>,
+        isolated_launch: Option<IsolatedLaunch>,
     ) -> Result<(), String> {
         if self
             .busy
@@ -220,6 +226,19 @@ impl LaunchManager {
                 self.busy.store(false, Ordering::Release);
                 return Err(format!("{message} The backend was not launched."));
             }
+            if isolated_launch.is_none() {
+                self.busy.store(false, Ordering::Release);
+                return Err(
+                    "Multi-account mode requires a unique per-instance launch path. The backend was not launched."
+                        .into(),
+                );
+            }
+        } else if isolated_launch.is_some() {
+            self.busy.store(false, Ordering::Release);
+            return Err(
+                "An isolated launch path cannot be used while multi-account protection is off."
+                    .into(),
+            );
         }
         self.cancel.store(false, Ordering::Release);
         let busy = Arc::clone(&self.busy);
@@ -228,11 +247,14 @@ impl LaunchManager {
         thread::Builder::new()
             .name("roblox-launch-monitor".into())
             .spawn(move || {
-                let backend = detection.resolve(selected);
+                let backend = isolated_launch
+                    .as_ref()
+                    .map(|launch| launch.backend)
+                    .unwrap_or_else(|| detection.resolve(selected));
                 let backend_label = backend.label().replace(" (recommended)", "");
                 let installation = detection.get(backend);
                 let result = (|| -> Result<(u32, String, String, bool), String> {
-                    if !installation.installed() {
+                    if isolated_launch.is_none() && !installation.installed() {
                         return Err(format!(
                             "{} is not available. Refresh detection or choose another backend.",
                             backend.label()
@@ -243,11 +265,30 @@ impl LaunchManager {
                         .map(|client| client.pid)
                         .collect();
                     let mut tracker = LaunchTracker::new(before);
-                    let _ = events.send(LaunchEvent::Starting(backend_label.clone()));
+                    let launch_label = isolated_launch.as_ref().map_or_else(
+                        || backend_label.clone(),
+                        |isolated| {
+                            format!(
+                                "{} through isolated Client-{:04}",
+                                backend_label, isolated.client_id
+                            )
+                        },
+                    );
+                    let _ = events.send(LaunchEvent::Starting(launch_label));
                     if let Some(health) = &required_protection {
                         verify_protection(health)?;
                     }
-                    let backend_pid = match backend {
+                    let backend_pid = if let Some(isolated) = &isolated_launch {
+                        if isolated.backend != backend {
+                            return Err(format!(
+                                "The isolated path was prepared for {}, but the resolved backend changed to {}. Refresh detection and retry.",
+                                isolated.backend.label(),
+                                backend.label()
+                            ));
+                        }
+                        platform::shell_launch(&isolated.executable, Some("roblox:"))
+                    } else {
+                        match backend {
                         LaunchBackend::Fishstrap | LaunchBackend::Bloxstrap => {
                             platform::shell_launch(
                                 installation.executable.as_ref().unwrap(),
@@ -265,6 +306,7 @@ impl LaunchManager {
                             Some("roblox:"),
                         ),
                         LaunchBackend::Auto => unreachable!(),
+                        }
                     }
                     .map_err(|message| format!("{backend_label} failed to start: {message}"))?;
                     let _ = events.send(LaunchEvent::Waiting(backend_pid));
@@ -309,10 +351,21 @@ impl LaunchManager {
                         }
                         if let Some(pid) = stable {
                             let warning = !tracker.closed_existing.is_empty();
+                            let mut detail = tracker.success_detail(backend_pid, &bootstrap_seen);
+                            if let Some(isolated) = &isolated_launch {
+                                detail.push_str(&format!(
+                                    " Per-instance path Client-{:04} ({}) targets {} ({}) via {}.",
+                                    isolated.client_id,
+                                    isolated.alias_path.display(),
+                                    isolated.version,
+                                    isolated.target_version.display(),
+                                    isolated.backend.label()
+                                ));
+                            }
                             return Ok((
                                 pid,
                                 backend_label.clone(),
-                                tracker.success_detail(backend_pid, &bootstrap_seen),
+                                detail,
                                 warning,
                             ));
                         }
@@ -326,10 +379,14 @@ impl LaunchManager {
                             backend,
                             detail,
                             warning,
+                            isolation: isolated_launch.clone(),
                         });
                     }
                     Err(message) => {
-                        let _ = events.send(LaunchEvent::Failed(message));
+                        let _ = events.send(LaunchEvent::Failed {
+                            message,
+                            isolation: isolated_launch.clone(),
+                        });
                     }
                 }
                 busy.store(false, Ordering::Release);
@@ -360,7 +417,13 @@ mod tests {
             crate::platform::detect_launchers(Some(std::path::Path::new(".tmp/tests/absent")));
         assert!(
             manager
-                .begin(empty, LaunchBackend::Auto, Duration::from_secs(1), None)
+                .begin(
+                    empty,
+                    LaunchBackend::Auto,
+                    Duration::from_secs(1),
+                    None,
+                    None,
+                )
                 .is_err()
         );
     }

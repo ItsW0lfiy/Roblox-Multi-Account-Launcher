@@ -23,7 +23,11 @@ The C# implementation already tried to respect thread-affine mutex ownership wit
 
 ## Launching
 
-`LaunchManager` atomically rejects overlapping bootstraps. It snapshots current Roblox PIDs, verifies both singleton guards when multi-account mode is active, launches the selected backend using `ShellExecuteExW`, and waits with a bounded timeout for a genuinely new `RobloxPlayerBeta.exe` PID. A candidate must remain alive for two seconds before success. Existing clients cannot be mistaken for the new client.
+`LaunchManager` atomically rejects overlapping bootstraps. It snapshots current Roblox PIDs, verifies both singleton guards when multi-account mode is active, and waits with a bounded timeout for a genuinely new `RobloxPlayerBeta.exe` PID. A candidate must remain alive for two seconds before success. Existing clients cannot be mistaken for the new client.
+
+Normal mode launches the selected backend through `ShellExecuteExW`. Multi-account mode first asks `InstancePathManager` to resolve the newest valid `RobloxPlayerBeta.exe` version directory for the selected backend, creates a unique `Instances\Client-NNNN` NTFS junction to that directory, and directly starts the client through the alias path. Fishstrap/Bloxstrap remain responsible for installation, updates, and modifications; no Roblox files are copied or changed. Auto checks Fishstrap → Bloxstrap → stock and selects the first backend with both an installed launcher and a usable active version directory.
+
+Each alias record tracks client ID, alias, target version, backend, and confirmed PID. A bound alias is removed only after its PID is gone. An unconfirmed alias is retained while any Roblox client is running. On restart, stale aliases are cleaned only when no Roblox clients exist. A backend update affects only new allocations; existing aliases and running clients are not retargeted.
 
 Launch diagnostics distinguish backend-start failure, backend start with no new player PID, transient/replaced player PIDs, observed Roblox launcher/installer processes, existing clients that close during bootstrap, and protection loss. Fishstrap/Bloxstrap process creation alone is never treated as Roblox launch success.
 
@@ -40,6 +44,7 @@ Native APIs implement:
 - window focus and positioning;
 - monitor work-area enumeration and 50/50, 70/30, vertical, and swapped layouts;
 - shell launch/open behavior;
+- native mount-point reparse creation/verification for per-client launch paths;
 - existing-window activation;
 - notification-area menu integration.
 - metadata-only `ReadDirectoryChangesW` tracing under `Roblox\LocalStorage`.
@@ -50,7 +55,7 @@ No injection, hooks, memory-content reads, registry writes, protocol rewrites, o
 
 Roblox desktop clients under the same Windows user profile can observe shared local login state. The launcher does not store accounts, credentials, `.ROBLOSECURITY`, authentication tickets, or cookies, and it does not attempt to restore stale authentication state.
 
-Login-state isolation is currently **unsupported / not enabled**. The Diagnostics page can start an explicit metadata-only trace of `%LOCALAPPDATA%\Roblox\LocalStorage`. The trace records relative file path, timestamp, create/write/delete/rename action, and `process=unavailable`; Windows directory notifications do not identify the writer. It never opens or reads the changed files. No candidate file is locked until manual evidence identifies a narrow state file and separate validation proves that locking it is safe.
+Bidirectional logout behavior has been manually validated three times while the existing external protections were active. The UI reports this as **Experimental / manually validated**, not as universal support. No additional auth-state file lock was introduced and no causal file is claimed. The Diagnostics page retains the explicit metadata-only trace of `%LOCALAPPDATA%\Roblox\LocalStorage` for future Roblox-version regressions.
 
 ## PowerShell Assist
 

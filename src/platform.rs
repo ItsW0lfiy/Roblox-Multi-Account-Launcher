@@ -516,20 +516,34 @@ pub fn detect_launchers(root: Option<&Path>) -> Detection {
             });
     }
     stock.base_dir = versions.is_dir().then_some(versions);
+    stock.version = stock
+        .executable
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
     let logs = local.join("Roblox").join("logs");
     stock.logs_dir = logs.is_dir().then_some(logs);
+    let fish_base = fish_dir
+        .is_dir()
+        .then_some(fish_dir.clone())
+        .or_else(|| fish_exe.as_ref()?.parent().map(PathBuf::from));
     let fishstrap = Installation {
         executable: fish_exe,
         version: None,
-        base_dir: fish_dir.is_dir().then_some(fish_dir.clone()),
+        base_dir: fish_base,
         logs_dir: [fish_dir.join("Logs"), fish_dir.join("logs")]
             .into_iter()
             .find(|p| p.is_dir()),
     };
+    let blox_base = blox_dir
+        .is_dir()
+        .then_some(blox_dir.clone())
+        .or_else(|| blox_exe.as_ref()?.parent().map(PathBuf::from));
     let bloxstrap = Installation {
         executable: blox_exe,
         version: None,
-        base_dir: blox_dir.is_dir().then_some(blox_dir.clone()),
+        base_dir: blox_base,
         logs_dir: [blox_dir.join("Logs"), blox_dir.join("logs")]
             .into_iter()
             .find(|p| p.is_dir()),

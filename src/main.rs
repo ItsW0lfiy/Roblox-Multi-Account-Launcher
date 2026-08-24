@@ -2,6 +2,7 @@
 
 mod app;
 mod diagnostics;
+mod instance_paths;
 mod launch;
 mod local_state;
 mod model;
