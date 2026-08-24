@@ -1,11 +1,14 @@
 use crate::{
+    audio::{self, AudioState},
     diagnostics,
+    history::{self, HistoryStore, LaunchHistoryEntry},
+    hotkeys::{HotkeyEvent, HotkeyManager},
     instance_paths::InstancePathManager,
     launch::{LaunchEvent, LaunchManager},
     local_state::{LocalStateTracer, TraceEvent},
     model::{
-        Activity, Detection, LaunchBackend, LayoutMode, ProtectionState, RobloxClient, Settings,
-        UpdateChannel,
+        Activity, ClientRole, Detection, LaunchBackend, LayoutMode, ProtectionState, ResourceMode,
+        RobloxClient, Settings, UpdateChannel,
     },
     platform::{self, AppInstanceGuard, ProtectionController, ProtectionEvent},
     powershell::{self, PowerShellInfo, PowerShellKind},
@@ -14,7 +17,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant, SystemTime},
@@ -43,7 +46,9 @@ enum Dialog {
         exit_after: bool,
     },
     ForceClient(u32),
+    CloseMultiple(Vec<u32>),
     UpdateBlocked(String),
+    ResetSettings,
 }
 
 enum CloseEvent {
@@ -65,6 +70,8 @@ struct TrayIds {
     tile: MenuId,
     focus1: MenuId,
     focus2: MenuId,
+    mute_alt: MenuId,
+    resource_alt: MenuId,
     close: MenuId,
     disable: MenuId,
     exit: MenuId,
@@ -82,6 +89,10 @@ pub struct LauncherApp {
     launch: LaunchManager,
     detection: Detection,
     clients: Vec<RobloxClient>,
+    client_roles: HashMap<u32, ClientRole>,
+    resource_modes: HashMap<u32, ResourceMode>,
+    audio_states: HashMap<u32, AudioState>,
+    audio_errors: HashMap<u32, String>,
     previous_pids: Vec<u32>,
     settings: Settings,
     settings_store: SettingsStore,
@@ -94,6 +105,7 @@ pub struct LauncherApp {
     activities: Vec<Activity>,
     last_refresh: Instant,
     last_health: Instant,
+    last_audio_refresh: Instant,
     dialog: Option<Dialog>,
     close_tx: mpsc::Sender<CloseEvent>,
     close_rx: mpsc::Receiver<CloseEvent>,
@@ -117,6 +129,13 @@ pub struct LauncherApp {
     updater: UpdateManager,
     automatic_update_started: bool,
     dismissed_update: Option<String>,
+    pending_target: Option<usize>,
+    next_queued_launch: Option<Instant>,
+    hotkeys: Option<HotkeyManager>,
+    launch_link_input: String,
+    history: HistoryStore,
+    expected_closes: HashSet<u32>,
+    forced_closes: HashSet<u32>,
 }
 
 impl LauncherApp {
@@ -140,12 +159,44 @@ impl LauncherApp {
         };
         let (tray, tray_ids) = build_tray();
         let clients = platform::enumerate_clients();
+        let client_roles = clients
+            .iter()
+            .enumerate()
+            .map(|(index, client)| {
+                (
+                    client.pid,
+                    if index == 0 {
+                        ClientRole::Primary
+                    } else {
+                        ClientRole::Secondary
+                    },
+                )
+            })
+            .collect();
+        let resource_modes = clients
+            .iter()
+            .map(|client| (client.pid, ResourceMode::Normal))
+            .collect();
+        let (hotkeys, hotkey_error) = if settings.global_hotkeys {
+            match HotkeyManager::start() {
+                Ok(manager) => (Some(manager), None),
+                Err(message) => (None, Some(message)),
+            }
+        } else {
+            (None, None)
+        };
         let instance_paths = InstancePathManager::new(root.join("Instances"), !clients.is_empty());
+        let history = HistoryStore::new(&root);
         let updater = UpdateManager::new(root.join("Updates"), settings.update_channel);
         let updater_error = updater.snapshot().error;
-        let initial_status = updater_error
+        let initial_status = hotkey_error
             .as_ref()
-            .map(|message| format!("The previous update attempt failed: {message}"))
+            .map(|message| format!("Global hotkeys are unavailable: {message}"))
+            .or_else(|| {
+                updater_error
+                    .as_ref()
+                    .map(|message| format!("The previous update attempt failed: {message}"))
+            })
             .unwrap_or_else(|| "Ready. Multi-account mode is off.".into());
         let initial_activities = vec![Activity {
             timestamp: SystemTime::now(),
@@ -168,6 +219,10 @@ impl LauncherApp {
             detection: platform::detect_launchers(None),
             previous_pids: clients.iter().map(|client| client.pid).collect(),
             clients,
+            client_roles,
+            resource_modes,
+            audio_states: HashMap::new(),
+            audio_errors: HashMap::new(),
             settings,
             settings_store,
             logger,
@@ -179,6 +234,7 @@ impl LauncherApp {
             activities: initial_activities,
             last_refresh: Instant::now(),
             last_health: Instant::now(),
+            last_audio_refresh: Instant::now() - Duration::from_secs(10),
             dialog: None,
             close_tx,
             close_rx,
@@ -202,6 +258,13 @@ impl LauncherApp {
             updater,
             automatic_update_started: false,
             dismissed_update: None,
+            pending_target: None,
+            next_queued_launch: None,
+            hotkeys,
+            launch_link_input: String::new(),
+            history,
+            expected_closes: HashSet::new(),
+            forced_closes: HashSet::new(),
         }
     }
 
@@ -228,17 +291,89 @@ impl LauncherApp {
                     format!("Client {} detected (PID {}).", client.number, client.pid),
                     false,
                 );
+                let role = if current.iter().position(|value| value.pid == client.pid) == Some(0) {
+                    ClientRole::Primary
+                } else {
+                    ClientRole::Secondary
+                };
+                self.client_roles.insert(client.pid, role);
+                let resource = if role == ClientRole::Secondary {
+                    self.settings.secondary_resource_mode
+                } else {
+                    ResourceMode::Normal
+                };
+                self.resource_modes.insert(client.pid, resource);
+                if let Err(message) = platform::set_resource_mode(client.pid, resource) {
+                    self.add_activity(message, true);
+                }
+                if role == ClientRole::Secondary {
+                    match audio::set(
+                        client.pid,
+                        self.settings.secondary_volume_percent,
+                        self.settings.secondary_muted,
+                    ) {
+                        Ok(sessions) => {
+                            self.audio_states.insert(
+                                client.pid,
+                                AudioState {
+                                    volume_percent: self.settings.secondary_volume_percent,
+                                    muted: self.settings.secondary_muted,
+                                    sessions,
+                                },
+                            );
+                        }
+                        Err(message) => {
+                            self.audio_errors.insert(client.pid, message);
+                        }
+                    }
+                }
             }
         }
         for pid in self.previous_pids.clone() {
             if !current.iter().any(|client| client.pid == pid) {
-                self.add_activity(format!("Roblox client PID {pid} exited."), false);
+                let classification = if self.forced_closes.remove(&pid) {
+                    "Force closed by launcher"
+                } else if self.expected_closes.remove(&pid) {
+                    "Closed normally"
+                } else {
+                    "Unexpected exit"
+                };
+                self.history.classify_exit(pid, classification);
+                self.add_activity(
+                    format!("Roblox client PID {pid} exited ({classification})."),
+                    classification == "Unexpected exit",
+                );
             }
         }
         self.previous_pids = current.iter().map(|client| client.pid).collect();
         self.clients = current;
+        let running: HashSet<u32> = self.clients.iter().map(|client| client.pid).collect();
+        self.client_roles.retain(|pid, _| running.contains(pid));
+        self.resource_modes.retain(|pid, _| running.contains(pid));
+        self.audio_states.retain(|pid, _| running.contains(pid));
+        self.audio_errors.retain(|pid, _| running.contains(pid));
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_tooltip(Some(format!(
+                "Roblox Multi-Account Launcher • {} • {} client(s)",
+                self.protection_state.label(),
+                self.clients.len()
+            )));
+        }
+        if self.last_audio_refresh.elapsed() >= Duration::from_secs(3) {
+            for pid in running.iter().copied() {
+                match audio::state(pid) {
+                    Ok(state) => {
+                        self.audio_states.insert(pid, state);
+                        self.audio_errors.remove(&pid);
+                    }
+                    Err(message) => {
+                        self.audio_errors.insert(pid, message);
+                    }
+                }
+            }
+            self.last_audio_refresh = Instant::now();
+        }
         if !self.launch.busy() {
-            let running: HashSet<u32> = self.clients.iter().map(|client| client.pid).collect();
             for message in self.instance_paths.cleanup_exited(&running) {
                 let error = message.starts_with("Could not");
                 if error {
@@ -252,6 +387,36 @@ impl LauncherApp {
     fn refresh_detection(&mut self) {
         self.detection = platform::detect_launchers(None);
         self.add_activity("Launcher and protocol detection refreshed.", false);
+    }
+
+    fn run_protection_self_test(&mut self) {
+        if self.protection_state == ProtectionState::Disabled {
+            self.status = "Protection self-test: Multi-Account Mode is disabled.".into();
+            return;
+        }
+        let health = self.protection.health().snapshot();
+        let resolved = self.detection.resolve(self.settings.backend);
+        let path_check = crate::instance_paths::resolve_active_version(&self.detection, resolved)
+            .map(|target| target.directory.join("RobloxPlayerBeta.exe").is_file())
+            .unwrap_or(false);
+        let owner_healthy = matches!(
+            self.protection_state,
+            ProtectionState::Protected | ProtectionState::Warning
+        );
+        let all = health.singleton_mutex
+            && health.singleton_event
+            && self.cookie_locked
+            && path_check
+            && owner_healthy;
+        self.status = format!(
+            "Protection self-test: mutex={}, event={}, cookie={}, path subsystem={}, owner state={}.",
+            held_label(health.singleton_mutex),
+            held_label(health.singleton_event),
+            held_label(self.cookie_locked),
+            if path_check { "READY" } else { "FAILED" },
+            if owner_healthy { "HEALTHY" } else { "FAILED" }
+        );
+        self.add_activity(self.status.clone(), !all);
     }
 
     fn begin_enable(&mut self) {
@@ -273,6 +438,7 @@ impl LauncherApp {
     }
 
     fn start_graceful_close(&mut self, pids: Vec<u32>, after_enable: bool, exit_after: bool) {
+        self.expected_closes.extend(pids.iter().copied());
         let sender = self.close_tx.clone();
         let timeout = Duration::from_secs(self.settings.graceful_close_seconds);
         self.status = "Requesting graceful Roblox shutdown…".into();
@@ -307,7 +473,20 @@ impl LauncherApp {
         });
     }
 
+    fn request_close_roblox(&mut self) {
+        let pids: Vec<u32> = self.clients.iter().map(|client| client.pid).collect();
+        if pids.len() > 1 {
+            self.dialog = Some(Dialog::CloseMultiple(pids));
+        } else if !pids.is_empty() {
+            self.start_graceful_close(pids, false, false);
+        }
+    }
+
     fn start_force_close(&mut self, pids: Vec<u32>, after_enable: bool, exit_after: bool) {
+        for pid in &pids {
+            self.expected_closes.remove(pid);
+        }
+        self.forced_closes.extend(pids.iter().copied());
         let sender = self.close_tx.clone();
         thread::spawn(move || {
             let failures = platform::force_close(&pids);
@@ -320,6 +499,26 @@ impl LauncherApp {
     }
 
     fn begin_launch(&mut self) {
+        let target = match self.settings.requested_launch_target(self.clients.len()) {
+            Ok(target) => target,
+            Err(message) => {
+                self.status =
+                    format!("{message} Raise the soft limit in Settings to launch another client.");
+                self.add_activity(self.status.clone(), true);
+                return;
+            }
+        };
+        if target > 1 && self.protection_state == ProtectionState::Disabled {
+            self.status =
+                "Enable Multi-Account Mode before requesting more than one Roblox client.".into();
+            self.add_activity(self.status.clone(), true);
+            return;
+        }
+        self.pending_target = Some(target);
+        self.begin_launch_once();
+    }
+
+    fn begin_launch_once(&mut self) {
         if self.protection_state == ProtectionState::Preparing {
             self.status = "Multi-account protection is still being prepared. Wait for READY before launching.".into();
             return;
@@ -335,7 +534,10 @@ impl LauncherApp {
             ProtectionState::Protected | ProtectionState::Warning
         )
         .then(|| self.protection.health());
-        let isolated_launch = if required_protection.is_some() {
+        let isolated_launch = if crate::launch::should_use_isolated_path(
+            required_protection.is_some(),
+            self.clients.len(),
+        ) {
             match self
                 .instance_paths
                 .allocate(&self.detection, self.settings.backend)
@@ -356,10 +558,19 @@ impl LauncherApp {
             None
         };
         let allocated_id = isolated_launch.as_ref().map(|launch| launch.client_id);
+        let launch_uri = match crate::links::validate(&self.launch_link_input) {
+            Ok(value) => value,
+            Err(message) => {
+                self.status = message.clone();
+                self.recent_error = Some(message);
+                return;
+            }
+        };
         match self.launch.begin(
             self.detection.clone(),
             self.settings.backend,
             Duration::from_secs(self.settings.launch_timeout_seconds),
+            launch_uri,
             required_protection,
             isolated_launch,
         ) {
@@ -436,6 +647,24 @@ impl LauncherApp {
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
+        let hotkey_events = self
+            .hotkeys
+            .as_ref()
+            .map(|manager| manager.events.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in hotkey_events {
+            let role = match event {
+                HotkeyEvent::FocusPrimary => ClientRole::Primary,
+                HotkeyEvent::FocusSecondary => ClientRole::Secondary,
+            };
+            if let Some(client) = self
+                .clients
+                .iter()
+                .find(|client| self.client_roles.get(&client.pid) == Some(&role))
+            {
+                platform::focus_window(client.window);
+            }
+        }
         while let Ok(event) = self.protection.events.try_recv() {
             match event {
                 ProtectionEvent::Enabled {
@@ -526,16 +755,78 @@ impl LauncherApp {
                     warning,
                     isolation,
                 } => {
-                    if let Some(isolation) = isolation {
+                    let (client_name, version, launch_type) = if let Some(isolation) = isolation {
+                        let values = (
+                            Some(format!("Client-{:04}", isolation.client_id)),
+                            isolation.version.clone(),
+                            "Isolated junction path".to_string(),
+                        );
                         self.instance_paths.bind_pid(isolation.client_id, pid);
-                    }
+                        values
+                    } else {
+                        let resolved = self.detection.resolve(self.settings.backend);
+                        (
+                            Some("Client 1".into()),
+                            self.detection
+                                .get(resolved)
+                                .version
+                                .clone()
+                                .unwrap_or_else(|| "Unknown".into()),
+                            "Normal backend".into(),
+                        )
+                    };
                     self.launch_text = "Roblox launched".into();
                     self.status = format!(
                         "New Roblox client confirmed through {backend} (PID {pid}). {detail}"
                     );
                     self.add_activity(self.status.clone(), warning);
+                    self.history.push(LaunchHistoryEntry {
+                        timestamp_unix: history::now_unix(),
+                        pid: Some(pid),
+                        client: client_name,
+                        role: if self.clients.is_empty() {
+                            ClientRole::Primary.label().into()
+                        } else {
+                            ClientRole::Secondary.label().into()
+                        },
+                        backend: backend.clone(),
+                        version,
+                        launch_type,
+                        result: if warning {
+                            "Success with warning"
+                        } else {
+                            "Success"
+                        }
+                        .into(),
+                        exit_classification: None,
+                    });
+                    self.refresh_clients();
+                    if self.settings.auto_arrange_after_launch && self.clients.len() >= 2 {
+                        self.tile();
+                    }
+                    if self
+                        .pending_target
+                        .is_some_and(|target| self.clients.len() >= target)
+                    {
+                        self.pending_target = None;
+                        self.next_queued_launch = None;
+                    } else if self.pending_target.is_some() {
+                        self.next_queued_launch = Some(Instant::now() + Duration::from_secs(1));
+                    }
                 }
                 LaunchEvent::Failed { message, isolation } => {
+                    let client_name = isolation
+                        .as_ref()
+                        .map(|value| format!("Client-{:04}", value.client_id));
+                    let version = isolation
+                        .as_ref()
+                        .map(|value| value.version.clone())
+                        .unwrap_or_else(|| "Unknown".into());
+                    let launch_type = if isolation.is_some() {
+                        "Isolated junction path"
+                    } else {
+                        "Normal backend"
+                    };
                     if let Some(isolation) = isolation {
                         self.instance_paths.mark_unconfirmed(isolation.client_id);
                     }
@@ -543,6 +834,19 @@ impl LauncherApp {
                     self.status = format!("Launch failed: {message}");
                     self.recent_error = Some(message.clone());
                     self.add_activity(self.status.clone(), true);
+                    self.history.push(LaunchHistoryEntry {
+                        timestamp_unix: history::now_unix(),
+                        pid: None,
+                        client: client_name,
+                        role: "Unassigned".into(),
+                        backend: self.detection.resolve(self.settings.backend).label().into(),
+                        version,
+                        launch_type: launch_type.into(),
+                        result: format!("Failed: {}", diagnostics::redact(&message)),
+                        exit_classification: Some("Exited during bootstrap / no stable PID".into()),
+                    });
+                    self.pending_target = None;
+                    self.next_queued_launch = None;
                 }
             }
         }
@@ -704,6 +1008,23 @@ impl LauncherApp {
                 }
             }
         }
+        if let (Some(target), Some(ready_at)) = (self.pending_target, self.next_queued_launch)
+            && !self.launch.busy()
+            && Instant::now() >= ready_at
+        {
+            self.refresh_clients();
+            if self.clients.len() >= target {
+                self.pending_target = None;
+                self.next_queued_launch = None;
+            } else if self.clients.len() >= self.settings.client_limit {
+                self.pending_target = None;
+                self.next_queued_launch = None;
+                self.status = "Queued launching stopped at the configured client limit.".into();
+            } else {
+                self.next_queued_launch = None;
+                self.begin_launch_once();
+            }
+        }
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
@@ -716,6 +1037,8 @@ impl LauncherApp {
             ids.tile.clone(),
             ids.focus1.clone(),
             ids.focus2.clone(),
+            ids.mute_alt.clone(),
+            ids.resource_alt.clone(),
             ids.close.clone(),
             ids.disable.clone(),
             ids.exit.clone(),
@@ -735,17 +1058,71 @@ impl LauncherApp {
                     self.swapped,
                 );
             } else if event.id == ids.3 {
-                if let Some(client) = self.clients.first() {
+                if let Some(client) = self
+                    .clients
+                    .iter()
+                    .find(|client| self.client_roles.get(&client.pid) == Some(&ClientRole::Primary))
+                {
                     platform::focus_window(client.window);
                 }
             } else if event.id == ids.4 {
-                if let Some(client) = self.clients.get(1) {
+                if let Some(client) = self.clients.iter().find(|client| {
+                    self.client_roles.get(&client.pid) == Some(&ClientRole::Secondary)
+                }) {
                     platform::focus_window(client.window);
                 }
             } else if event.id == ids.5 {
-                let pids = self.clients.iter().map(|client| client.pid).collect();
-                self.start_graceful_close(pids, false, false);
+                if let Some(client) = self.clients.iter().find(|client| {
+                    self.client_roles.get(&client.pid) == Some(&ClientRole::Secondary)
+                }) {
+                    let volume = self
+                        .audio_states
+                        .get(&client.pid)
+                        .map_or(self.settings.secondary_volume_percent, |state| {
+                            state.volume_percent
+                        });
+                    let muted = !self
+                        .audio_states
+                        .get(&client.pid)
+                        .is_some_and(|state| state.muted);
+                    match audio::set(client.pid, volume, muted) {
+                        Ok(sessions) => {
+                            self.audio_states.insert(
+                                client.pid,
+                                AudioState {
+                                    volume_percent: volume,
+                                    muted,
+                                    sessions,
+                                },
+                            );
+                        }
+                        Err(message) => self.status = message,
+                    }
+                }
             } else if event.id == ids.6 {
+                if let Some(client) = self.clients.iter().find(|client| {
+                    self.client_roles.get(&client.pid) == Some(&ClientRole::Secondary)
+                }) {
+                    let current = self
+                        .resource_modes
+                        .get(&client.pid)
+                        .copied()
+                        .unwrap_or(ResourceMode::Normal);
+                    let next = if current == ResourceMode::AltSaver {
+                        ResourceMode::Normal
+                    } else {
+                        ResourceMode::AltSaver
+                    };
+                    match platform::set_resource_mode(client.pid, next) {
+                        Ok(()) => {
+                            self.resource_modes.insert(client.pid, next);
+                        }
+                        Err(message) => self.status = message,
+                    }
+                }
+            } else if event.id == ids.7 {
+                self.request_close_roblox();
+            } else if event.id == ids.8 {
                 if self.launch.busy() {
                     self.status = "Wait for the active Roblox bootstrap to finish before disabling multi-account protection.".into();
                 } else if self.clients.is_empty() {
@@ -753,7 +1130,7 @@ impl LauncherApp {
                 } else {
                     self.dialog = Some(Dialog::DisableWithClients);
                 }
-            } else if event.id == ids.7 {
+            } else if event.id == ids.9 {
                 self.request_exit(ctx);
             }
         }
@@ -778,9 +1155,11 @@ impl LauncherApp {
                         .color(Color32::from_rgb(244, 246, 250)),
                 );
                 ui.label(
-                    RichText::new(
-                        "Rust core • native Windows APIs • optional PowerShell assistance",
-                    )
+                    RichText::new(concat!(
+                        "v",
+                        env!("CARGO_PKG_VERSION"),
+                        " • Experimental pre-release • Rust core • native Windows APIs"
+                    ))
                     .color(Color32::from_rgb(150, 155, 168)),
                 );
             });
@@ -837,6 +1216,12 @@ impl LauncherApp {
                             ))
                             .color(Color32::from_rgb(155, 159, 172)),
                         );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.launch_link_input)
+                                .hint_text("Optional Roblox game/share/protocol link")
+                                .desired_width(430.0),
+                        )
+                        .on_hover_text("Transient input only. Credentials and foreign hosts are refused; the link is not saved in settings or history.");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let enabled = !self.launch.busy()
@@ -857,13 +1242,16 @@ impl LauncherApp {
 
     fn navigation(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (page, label) in [
+            let mut pages = vec![
                 (Page::Home, "Home"),
                 (Page::Clients, "Clients"),
                 (Page::Diagnostics, "Diagnostics"),
-                (Page::PowerShell, "PowerShell Assist"),
                 (Page::Settings, "Settings"),
-            ] {
+            ];
+            if self.settings.advanced_mode {
+                pages.insert(3, (Page::PowerShell, "PowerShell Assist"));
+            }
+            for (page, label) in pages {
                 if ui.selectable_label(self.page == page, label).clicked() {
                     self.page = page;
                 }
@@ -901,6 +1289,15 @@ impl LauncherApp {
                     && ui.button("Retry Multi-Account Setup").clicked() {
                     if self.clients.is_empty() { self.begin_enable(); } else { self.dialog = Some(Dialog::EnableWithClients(self.clients.iter().map(|client| client.pid).collect())); }
                 }
+                if ui
+                    .add_enabled(
+                        self.protection_state != ProtectionState::Disabled,
+                        egui::Button::new("Run Protection Self-Test"),
+                    )
+                    .clicked()
+                {
+                    self.run_protection_self_test();
+                }
             });
             card(&mut columns[1], "Launch Backend", |ui| {
                 let resolved = self.detection.resolve(self.settings.backend);
@@ -910,6 +1307,43 @@ impl LauncherApp {
                 state_row(ui, "Bloxstrap", if self.detection.bloxstrap.installed() { "Detected" } else { "Not detected" }, if self.detection.bloxstrap.installed() { ProtectionState::Protected } else { ProtectionState::Disabled });
                 state_row(ui, "Stock Roblox", if self.detection.stock.installed() { "Detected" } else { "Not detected" }, if self.detection.stock.installed() { ProtectionState::Protected } else { ProtectionState::Warning });
                 if ui.button("Refresh Detection").clicked() { self.refresh_detection(); }
+                let installation = self.detection.get(resolved).clone();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(installation.installed(), egui::Button::new(format!("Open {}", resolved.label())))
+                        .clicked()
+                        && let Some(executable) = installation.executable
+                    {
+                        let _ = platform::shell_launch(&executable, None);
+                    }
+                    if ui
+                        .add_enabled(installation.base_dir.is_some(), egui::Button::new("Open Folder"))
+                        .clicked()
+                        && let Some(folder) = installation.base_dir
+                    {
+                        let _ = platform::shell_launch(&folder, None);
+                    }
+                    if ui
+                        .add_enabled(installation.logs_dir.is_some(), egui::Button::new("Open Logs"))
+                        .clicked()
+                        && let Some(logs) = installation.logs_dir
+                    {
+                        let _ = platform::shell_launch(&logs, None);
+                    }
+                });
+                let busy = platform::launcher_related_processes();
+                if !busy.is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(230, 176, 70),
+                        format!(
+                            "Bootstrap/update activity: {}",
+                            busy.iter()
+                                .map(|(pid, name)| format!("{name} ({pid})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                }
             });
         });
         ui.add_space(12.0);
@@ -958,11 +1392,20 @@ impl LauncherApp {
                 self.refresh_clients();
             }
             if ui.button("Close Roblox").clicked() && !self.clients.is_empty() {
-                self.start_graceful_close(
-                    self.clients.iter().map(|client| client.pid).collect(),
-                    false,
-                    false,
-                );
+                self.request_close_roblox();
+            }
+            if ui.button("Restore All").clicked() {
+                platform::restore_clients(&self.clients);
+            }
+            if ui.button("Center Primary").clicked()
+                && let Some(primary) = self
+                    .clients
+                    .iter()
+                    .find(|client| self.client_roles.get(&client.pid) == Some(&ClientRole::Primary))
+                && let Err(message) =
+                    platform::center_client(primary, self.settings.preferred_monitor.as_deref())
+            {
+                self.status = message;
             }
         });
         if self.clients.is_empty() {
@@ -974,16 +1417,51 @@ impl LauncherApp {
         }
         for client in self.clients.clone() {
             let isolated = self.instance_paths.record_for_pid(client.pid).cloned();
+            let mut role = self
+                .client_roles
+                .get(&client.pid)
+                .copied()
+                .unwrap_or(ClientRole::Custom);
+            let original_role = role;
+            let mut resource = self
+                .resource_modes
+                .get(&client.pid)
+                .copied()
+                .unwrap_or(ResourceMode::Normal);
+            let original_resource = resource;
+            let audio_state = self.audio_states.get(&client.pid).copied();
+            let mut volume = audio_state.map_or(100, |state| state.volume_percent);
+            let mut muted = audio_state.is_some_and(|state| state.muted);
+            let mut apply_audio = false;
             card(
                 ui,
                 &format!("Client {}  •  PID {}", client.number, client.pid),
                 |ui| {
                     ui.label(format!(
-                        "Uptime: {}  •  RAM: {:.0} MB  •  Window: {}",
+                        "Uptime: {}  •  CPU time: {}  •  RAM: {:.0} MB  •  Window: {}",
                         format_duration(client.uptime),
+                        format_duration(client.cpu_time),
                         client.working_set as f64 / 1_048_576.0,
                         client.title
                     ));
+                    ui.horizontal(|ui| {
+                        ui.label("Role");
+                        egui::ComboBox::from_id_salt(("client-role", client.pid))
+                            .selected_text(role.label())
+                            .show_ui(ui, |ui| {
+                                for value in ClientRole::ALL {
+                                    ui.selectable_value(&mut role, value, value.label());
+                                }
+                            });
+                        ui.label("Resource mode");
+                        egui::ComboBox::from_id_salt(("resource-mode", client.pid))
+                            .selected_text(resource.label())
+                            .show_ui(ui, |ui| {
+                                for value in ResourceMode::ALL {
+                                    ui.selectable_value(&mut resource, value, value.label());
+                                }
+                            });
+                    });
                     if let Some(record) = &isolated {
                         ui.label(format!(
                             "Launch path: isolated Client-{:04}  •  Backend: {}  •  Version: {}",
@@ -1000,6 +1478,30 @@ impl LauncherApp {
                         ui.label("Launch path: external or normal backend path");
                     }
                     ui.horizontal(|ui| {
+                        ui.label("Audio");
+                        if ui
+                            .add(egui::Slider::new(&mut volume, 0..=100).suffix("%"))
+                            .changed()
+                        {
+                            apply_audio = true;
+                        }
+                        if ui.checkbox(&mut muted, "Mute").changed() {
+                            apply_audio = true;
+                        }
+                        if let Some(state) = audio_state {
+                            ui.label(format!("{} session(s)", state.sessions));
+                        } else {
+                            ui.label("No active audio session");
+                        }
+                    });
+                    if let Some(message) = self.audio_errors.get(&client.pid) {
+                        ui.label(
+                            RichText::new(message)
+                                .small()
+                                .color(Color32::from_rgb(155, 159, 172)),
+                        );
+                    }
+                    ui.horizontal(|ui| {
                         if ui.button("Focus Client").clicked() {
                             platform::focus_window(client.window);
                         }
@@ -1012,6 +1514,59 @@ impl LauncherApp {
                     });
                 },
             );
+            if role != original_role {
+                if matches!(role, ClientRole::Primary | ClientRole::Secondary)
+                    && let Some(previous) = self
+                        .client_roles
+                        .iter()
+                        .find(|(pid, value)| **pid != client.pid && **value == role)
+                        .map(|(pid, _)| *pid)
+                {
+                    self.client_roles.insert(previous, ClientRole::Custom);
+                }
+                self.client_roles.insert(client.pid, role);
+                self.add_activity(
+                    format!("PID {} role changed to {}.", client.pid, role.label()),
+                    false,
+                );
+            }
+            if resource != original_resource {
+                match platform::set_resource_mode(client.pid, resource) {
+                    Ok(()) => {
+                        self.resource_modes.insert(client.pid, resource);
+                        self.add_activity(
+                            format!(
+                                "PID {} resource mode set to {}.",
+                                client.pid,
+                                resource.label()
+                            ),
+                            false,
+                        );
+                    }
+                    Err(message) => {
+                        self.status = message.clone();
+                        self.add_activity(message, true);
+                    }
+                }
+            }
+            if apply_audio {
+                match audio::set(client.pid, volume, muted) {
+                    Ok(sessions) => {
+                        self.audio_states.insert(
+                            client.pid,
+                            AudioState {
+                                volume_percent: volume,
+                                muted,
+                                sessions,
+                            },
+                        );
+                    }
+                    Err(message) => {
+                        self.audio_errors.insert(client.pid, message.clone());
+                        self.status = message;
+                    }
+                }
+            }
         }
         if self.clients.len() == 2 {
             ui.separator();
@@ -1032,13 +1587,39 @@ impl LauncherApp {
                     self.swapped = !self.swapped;
                     self.tile();
                 }
+                if ui.button("Swap Roles").clicked() {
+                    let primary = self
+                        .clients
+                        .iter()
+                        .find(|client| {
+                            self.client_roles.get(&client.pid) == Some(&ClientRole::Primary)
+                        })
+                        .map(|client| client.pid);
+                    let secondary = self
+                        .clients
+                        .iter()
+                        .find(|client| {
+                            self.client_roles.get(&client.pid) == Some(&ClientRole::Secondary)
+                        })
+                        .map(|client| client.pid);
+                    if let (Some(primary), Some(secondary)) = (primary, secondary) {
+                        self.client_roles.insert(primary, ClientRole::Secondary);
+                        self.client_roles.insert(secondary, ClientRole::Primary);
+                    }
+                }
             });
         }
     }
 
     fn tile(&mut self) {
+        let mut clients = self.clients.clone();
+        clients.sort_by_key(|client| match self.client_roles.get(&client.pid) {
+            Some(ClientRole::Primary) => 0,
+            Some(ClientRole::Secondary) => 1,
+            _ => 2,
+        });
         match platform::tile_clients(
-            &self.clients,
+            &clients,
             self.settings.layout,
             self.settings.preferred_monitor.as_deref(),
             self.swapped,
@@ -1069,6 +1650,9 @@ impl LauncherApp {
             powershell: &self.powershell,
             recent_error: self.recent_error.as_deref(),
             updater: &update_snapshot,
+            roles: &self.client_roles,
+            resources: &self.resource_modes,
+            audio: &self.audio_states,
         });
         ui.horizontal(|ui| {
             ui.heading("Diagnostics");
@@ -1080,6 +1664,25 @@ impl LauncherApp {
                 ui.ctx().copy_text(report.clone());
                 self.add_activity("Sanitized diagnostics copied.", false);
             }
+            if ui.button("Create Support Bundle").clicked() {
+                match crate::support::create_bundle(
+                    &self.data_root,
+                    &report,
+                    &self.settings,
+                    self.history.entries(),
+                ) {
+                    Ok(path) => {
+                        self.status =
+                            format!("Sanitized support bundle created at {}.", path.display());
+                        self.add_activity(self.status.clone(), false);
+                        let _ = platform::shell_launch(&path, None);
+                    }
+                    Err(message) => {
+                        self.status = format!("Support bundle failed: {message}");
+                        self.add_activity(self.status.clone(), true);
+                    }
+                }
+            }
         });
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add(
@@ -1090,6 +1693,68 @@ impl LauncherApp {
                     .interactive(false),
             );
             ui.add_space(12.0);
+            ui.heading("Launch recovery & instance cleanup");
+            let related = platform::launcher_related_processes();
+            let windowless: Vec<_> = self
+                .clients
+                .iter()
+                .filter(|client| client.window == 0)
+                .map(|client| client.pid)
+                .collect();
+            let stale = self.instance_paths.stale_aliases();
+            ui.label(format!(
+                "Active clients: {} • Windowless Roblox PIDs: {} • Related bootstrap/crash processes: {} • Stale aliases: {}",
+                self.clients.len(),
+                if windowless.is_empty() { "None".into() } else { windowless.iter().map(u32::to_string).collect::<Vec<_>>().join(", ") },
+                related.len(),
+                stale.len()
+            ));
+            for (pid, name) in &related {
+                ui.label(format!("{name} • PID {pid}"));
+            }
+            for alias in &stale {
+                ui.label(format!("Stale alias: {}", alias.display()));
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Run Protection Self-Test").clicked() {
+                    self.run_protection_self_test();
+                }
+                if ui.button("Open Instance Folder").clicked() {
+                    let _ = platform::shell_launch(self.instance_paths.root(), None);
+                }
+                if ui
+                    .add_enabled(self.clients.is_empty() && !stale.is_empty(), egui::Button::new("Clean Stale Aliases"))
+                    .clicked()
+                {
+                    match self.instance_paths.cleanup_stale_now(false) {
+                        Ok(messages) => {
+                            self.status = if messages.is_empty() {
+                                "No stale aliases required cleanup.".into()
+                            } else {
+                                messages.join(" ")
+                            };
+                        }
+                        Err(message) => self.status = message,
+                    }
+                }
+            });
+            ui.label("Recovery actions are intentionally conservative: force-close remains a separately confirmed action, and aliases are never deleted while Roblox is running.");
+            ui.separator();
+            ui.heading("Recent launch history");
+            for entry in self.history.entries().iter().take(12) {
+                ui.label(format!(
+                    "{} • {} • {} • {} • {}",
+                    entry.timestamp_unix,
+                    entry.client.as_deref().unwrap_or("Unconfirmed client"),
+                    entry.role,
+                    entry.backend,
+                    entry.result
+                ));
+                if let Some(exit) = &entry.exit_classification {
+                    ui.label(RichText::new(format!("  Exit: {exit}")).small());
+                }
+            }
+            ui.separator();
             ui.heading("Shared login-state investigation");
             state_row(
                 ui,
@@ -1100,6 +1765,7 @@ impl LauncherApp {
             ui.label("Bidirectional logout isolation was manually validated three times with the external protections active. This remains experimental until it is validated across Roblox updates and other Windows profiles.");
             ui.label("No credential, cookie, ticket, or file-content handling is implemented.");
             ui.label("The tracer below records only relative path, time, and create/write/delete/rename metadata under Roblox\\LocalStorage. Windows directory notifications do not identify the responsible process, so process is recorded as unavailable.");
+            if self.settings.advanced_mode {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -1123,6 +1789,9 @@ impl LauncherApp {
             ui.label(RichText::new(&self.trace_status).color(Color32::from_rgb(155, 159, 172)));
             for event in self.trace_events.iter().take(12) {
                 ui.label(RichText::new(event).monospace().color(Color32::from_rgb(169, 173, 185)));
+            }
+            } else {
+                ui.label("Enable Advanced Mode in Settings to use the metadata-only local-state tracer.");
             }
         });
     }
@@ -1252,6 +1921,58 @@ impl LauncherApp {
                         }
                     });
                 ui.end_row();
+                ui.label("Auto-arrange");
+                ui.checkbox(
+                    &mut self.settings.auto_arrange_after_launch,
+                    "Apply the selected layout after Client 2+ launches",
+                );
+                ui.end_row();
+                ui.label("Soft client limit");
+                ui.add(egui::Slider::new(&mut self.settings.client_limit, 1..=8));
+                ui.end_row();
+                ui.label("One-click target");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.launch_to_desired_count, "Launch until");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.settings.desired_client_count,
+                            1..=self.settings.client_limit,
+                        )
+                        .suffix(" clients"),
+                    );
+                });
+                ui.end_row();
+                ui.label("Secondary resource preset");
+                egui::ComboBox::from_id_salt("secondary-resource-mode")
+                    .selected_text(self.settings.secondary_resource_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in ResourceMode::ALL {
+                            ui.selectable_value(
+                                &mut self.settings.secondary_resource_mode,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
+                ui.end_row();
+                ui.label("Secondary audio preset");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.secondary_volume_percent, 0..=100)
+                            .suffix("%"),
+                    );
+                    ui.checkbox(&mut self.settings.secondary_muted, "Mute");
+                });
+                ui.end_row();
+                ui.label("Global hotkeys");
+                ui.checkbox(
+                    &mut self.settings.global_hotkeys,
+                    "Ctrl+Alt+1 / Ctrl+Alt+2 (off by default)",
+                );
+                ui.end_row();
+                ui.label("Interface");
+                ui.checkbox(&mut self.settings.advanced_mode, "Show advanced controls");
+                ui.end_row();
                 ui.label("Launch timeout");
                 ui.add(
                     egui::Slider::new(&mut self.settings.launch_timeout_seconds, 10..=180)
@@ -1300,6 +2021,19 @@ impl LauncherApp {
             self.updater.set_channel(self.settings.update_channel);
         }
         if ui.button("Save Settings").clicked() {
+            self.settings.normalize();
+            if self.settings.global_hotkeys && self.hotkeys.is_none() {
+                match HotkeyManager::start() {
+                    Ok(manager) => self.hotkeys = Some(manager),
+                    Err(message) => {
+                        self.settings.global_hotkeys = false;
+                        self.status = format!("Global hotkeys could not be enabled: {message}");
+                        self.add_activity(self.status.clone(), true);
+                    }
+                }
+            } else if !self.settings.global_hotkeys {
+                self.hotkeys = None;
+            }
             match self.settings_store.save(&self.settings) {
                 Ok(()) => {
                     self.status = "Settings saved.".into();
@@ -1311,6 +2045,51 @@ impl LauncherApp {
                 }
             }
         }
+        ui.horizontal_wrapped(|ui| {
+            let transfer = self.data_root.join("settings-transfer.json");
+            if ui.button("Export Settings").clicked() {
+                match self.settings_store.export_to(&self.settings, &transfer) {
+                    Ok(()) => self.status = format!("Settings exported to {}.", transfer.display()),
+                    Err(message) => self.status = format!("Settings export failed: {message}"),
+                }
+            }
+            if ui.button("Import Settings").clicked() {
+                match self.settings_store.import_from(&transfer) {
+                    Ok(settings) => {
+                        self.settings = settings;
+                        self.updater.set_channel(self.settings.update_channel);
+                        self.status = format!(
+                            "Settings imported from {}. Save to keep them.",
+                            transfer.display()
+                        );
+                    }
+                    Err(message) => self.status = format!("Settings import failed: {message}"),
+                }
+            }
+            if ui.button("Open Application Data").clicked() {
+                let _ = platform::shell_launch(&self.data_root, None);
+            }
+            if ui.button("Reset Application Settings").clicked() {
+                self.dialog = Some(Dialog::ResetSettings);
+            }
+        });
+        ui.label(
+            RichText::new(format!(
+                "Data mode: {} • {}",
+                if std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|parent| parent.join("portable.flag")))
+                    .is_some_and(|path| path.is_file())
+                {
+                    "Portable"
+                } else {
+                    "LocalAppData"
+                },
+                self.data_root.display()
+            ))
+            .small()
+            .color(Color32::from_rgb(155, 159, 172)),
+        );
         ui.add_space(12.0);
         ui.label(
             RichText::new("Multi-account mode is intentionally never persisted.")
@@ -1370,6 +2149,18 @@ impl LauncherApp {
                     ui.end_row();
                 });
 
+            ui.horizontal_wrapped(|ui| {
+                for (label, url) in [
+                    ("Open GitHub Repository", updater::GITHUB_URL),
+                    ("Open Releases", updater::RELEASES_URL),
+                    ("Report a Bug", updater::ISSUES_URL),
+                ] {
+                    if ui.button(label).clicked() {
+                        let _ = platform::shell_open_uri(url);
+                    }
+                }
+            });
+
             if !snapshot.configured {
                 ui.add_space(8.0);
                 ui.label(
@@ -1407,6 +2198,19 @@ impl LauncherApp {
                 ) && ui.button("Cancel").clicked()
                 {
                     self.updater.cancel();
+                }
+                if snapshot.rollback_available && ui.button("Prepare Rollback").clicked() {
+                    let live_block = updater::update_block_reason(
+                        self.protection_state != ProtectionState::Disabled,
+                        self.clients.len(),
+                    );
+                    if let Some(reason) = live_block {
+                        self.dialog = Some(Dialog::UpdateBlocked(reason));
+                    } else if let Err(message) = self.updater.prepare_rollback() {
+                        self.status = format!("Rollback could not be prepared: {message}");
+                    } else {
+                        self.status = "Verified previous executable prepared. Use Update & Restart to roll back.".into();
+                    }
                 }
                 if snapshot.state == UpdateState::UpdateAvailable {
                     if ui.button("Update").clicked() {
@@ -1576,6 +2380,37 @@ impl LauncherApp {
                     self.dialog = Some(Dialog::ForceClient(pid));
                 }
             }
+            Dialog::CloseMultiple(pids) => {
+                egui::Window::new("Close all Roblox clients?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "Close {} Roblox clients? Active game progress may be interrupted.",
+                            pids.len()
+                        ));
+                        ui.label(format!(
+                            "PIDs: {}",
+                            pids.iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                keep = false;
+                            }
+                            if ui.button("Close Roblox").clicked() {
+                                self.start_graceful_close(pids.clone(), false, false);
+                                keep = false;
+                            }
+                        });
+                    });
+                if keep {
+                    self.dialog = Some(Dialog::CloseMultiple(pids));
+                }
+            }
             Dialog::UpdateBlocked(reason) => {
                 egui::Window::new("Update postponed")
                     .collapsible(false)
@@ -1591,6 +2426,32 @@ impl LauncherApp {
                     });
                 if keep {
                     self.dialog = Some(Dialog::UpdateBlocked(reason));
+                }
+            }
+            Dialog::ResetSettings => {
+                egui::Window::new("Reset Application Settings?")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label("This resets launcher preferences only. Roblox, Fishstrap, Bloxstrap, browser, and Windows account data are not touched.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                keep = false;
+                            }
+                            if ui.button("Reset Launcher Settings").clicked() {
+                                self.settings = Settings::default();
+                                self.hotkeys = None;
+                                match self.settings_store.save(&self.settings) {
+                                    Ok(()) => self.status = "Application settings reset.".into(),
+                                    Err(message) => self.status = format!("Settings reset could not be saved: {message}"),
+                                }
+                                keep = false;
+                            }
+                        });
+                    });
+                if keep {
+                    self.dialog = Some(Dialog::ResetSettings);
                 }
             }
         }
@@ -1654,6 +2515,23 @@ impl eframe::App for LauncherApp {
                     });
             });
         self.dialogs(&ctx);
+        if !self.settings.first_run_completed {
+            egui::Window::new("Welcome")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.heading("Roblox Multi-Account Launcher");
+                    ui.label("Multi-Account Mode always starts off. Enable it before launching concurrent clients.");
+                    ui.label("Client 1 uses the selected backend; Client 2+ use isolated junction launch paths.");
+                    ui.label("The launcher does not store credentials, read cookie contents, inject into Roblox, or send telemetry.");
+                    ui.label("PowerShell 7 assistance is optional; all core protection and launching remain native Rust.");
+                    if ui.button("Continue").clicked() {
+                        self.settings.first_run_completed = true;
+                        let _ = self.settings_store.save(&self.settings);
+                    }
+                });
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1662,6 +2540,11 @@ impl eframe::App for LauncherApp {
         self.stop_local_state_trace();
         self.ps_cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        for (pid, mode) in self.resource_modes.clone() {
+            if mode != ResourceMode::Normal && platform::process_exists(pid) {
+                let _ = platform::set_resource_mode(pid, ResourceMode::Normal);
+            }
+        }
         let _ = self.settings_store.save(&self.settings);
         let running: HashSet<u32> = platform::enumerate_clients()
             .into_iter()
@@ -1744,6 +2627,10 @@ fn state_row(ui: &mut egui::Ui, label: &str, value: &str, state: ProtectionState
     });
 }
 
+fn held_label(value: bool) -> &'static str {
+    if value { "HELD" } else { "NOT HELD" }
+}
+
 fn format_duration(value: Duration) -> String {
     let seconds = value.as_secs();
     format!(
@@ -1761,6 +2648,8 @@ fn build_tray() -> (Option<TrayIcon>, Option<TrayIds>) {
     let tile = MenuItem::new("Tile Clients", true, None);
     let focus1 = MenuItem::new("Focus Client 1", true, None);
     let focus2 = MenuItem::new("Focus Client 2", true, None);
+    let mute_alt = MenuItem::new("Toggle Alt Mute", true, None);
+    let resource_alt = MenuItem::new("Toggle Alt Resource Saver", true, None);
     let close = MenuItem::new("Close Roblox", true, None);
     let disable = MenuItem::new("Disable Multi-Account", true, None);
     let exit = MenuItem::new("Exit", true, None);
@@ -1771,6 +2660,8 @@ fn build_tray() -> (Option<TrayIcon>, Option<TrayIds>) {
             &tile,
             &focus1,
             &focus2,
+            &mute_alt,
+            &resource_alt,
             &close,
             &disable,
             &PredefinedMenuItem::separator(),
@@ -1807,6 +2698,8 @@ fn build_tray() -> (Option<TrayIcon>, Option<TrayIds>) {
         tile: tile.id().clone(),
         focus1: focus1.id().clone(),
         focus2: focus2.id().clone(),
+        mute_alt: mute_alt.id().clone(),
+        resource_alt: resource_alt.id().clone(),
         close: close.id().clone(),
         disable: disable.id().clone(),
         exit: exit.id().clone(),

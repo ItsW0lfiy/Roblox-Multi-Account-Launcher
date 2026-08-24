@@ -22,7 +22,6 @@ pub const REPAIR_LAUNCH_STATE: &str = include_str!("../scripts/repair_launch_sta
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerShellKind {
     PowerShell7,
-    WindowsPowerShell,
     None,
 }
 
@@ -37,14 +36,12 @@ impl PowerShellInfo {
     pub fn engine_label(&self) -> &'static str {
         match self.kind {
             PowerShellKind::PowerShell7 => "PowerShell 7",
-            PowerShellKind::WindowsPowerShell => "Windows PowerShell 5.1",
             PowerShellKind::None => "Not available",
         }
     }
     pub fn capability(&self) -> &'static str {
         match self.kind {
             PowerShellKind::PowerShell7 => "Full",
-            PowerShellKind::WindowsPowerShell => "Compatibility",
             PowerShellKind::None => "Rust-only mode",
         }
     }
@@ -69,20 +66,7 @@ pub fn detect() -> PowerShellInfo {
     let (kind, executable) = if pwsh.is_some() {
         (PowerShellKind::PowerShell7, pwsh)
     } else {
-        let legacy = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .map(|path| {
-                path.join("System32")
-                    .join("WindowsPowerShell")
-                    .join("v1.0")
-                    .join("powershell.exe")
-            })
-            .filter(|path| path.is_file());
-        if legacy.is_some() {
-            (PowerShellKind::WindowsPowerShell, legacy)
-        } else {
-            (PowerShellKind::None, None)
-        }
+        (PowerShellKind::None, None)
     };
     let version = executable
         .as_ref()
@@ -166,7 +150,7 @@ pub fn run_script(
     cancel: Arc<AtomicBool>,
 ) -> Result<Value, String> {
     let executable = info.executable.as_ref().ok_or(
-        "PowerShell is not available. Core launcher features remain available in Rust-only mode.",
+        "PowerShell 7 is not available. Windows PowerShell 5.1 is intentionally not used; core launcher features remain available in Rust-only mode.",
     )?;
     let output = run_command(executable, script, timeout, cancel)?;
     serde_json::from_str(output.trim())

@@ -39,6 +39,44 @@ pub enum UpdateChannel {
     Prerelease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientRole {
+    Primary,
+    Secondary,
+    Custom,
+}
+
+impl ClientRole {
+    pub const ALL: [Self; 3] = [Self::Primary, Self::Secondary, Self::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "Primary",
+            Self::Secondary => "Secondary / Alt",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceMode {
+    Normal,
+    Balanced,
+    AltSaver,
+}
+
+impl ResourceMode {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Balanced, Self::AltSaver];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Balanced => "Balanced",
+            Self::AltSaver => "Alt Saver",
+        }
+    }
+}
+
 impl UpdateChannel {
     pub const ALL: [Self; 2] = [Self::Stable, Self::Prerelease];
 
@@ -138,6 +176,7 @@ pub struct RobloxClient {
     pub pid: u32,
     pub uptime: Duration,
     pub working_set: u64,
+    pub cpu_time: Duration,
     pub window: isize,
     pub title: String,
 }
@@ -154,6 +193,16 @@ pub struct Settings {
     pub powershell_assist: bool,
     pub automatic_update_checks: bool,
     pub update_channel: UpdateChannel,
+    pub auto_arrange_after_launch: bool,
+    pub client_limit: usize,
+    pub desired_client_count: usize,
+    pub launch_to_desired_count: bool,
+    pub secondary_resource_mode: ResourceMode,
+    pub secondary_volume_percent: u8,
+    pub secondary_muted: bool,
+    pub global_hotkeys: bool,
+    pub advanced_mode: bool,
+    pub first_run_completed: bool,
 }
 
 impl Default for Settings {
@@ -168,6 +217,16 @@ impl Default for Settings {
             powershell_assist: true,
             automatic_update_checks: true,
             update_channel: UpdateChannel::Stable,
+            auto_arrange_after_launch: false,
+            client_limit: 2,
+            desired_client_count: 1,
+            launch_to_desired_count: false,
+            secondary_resource_mode: ResourceMode::Balanced,
+            secondary_volume_percent: 35,
+            secondary_muted: false,
+            global_hotkeys: false,
+            advanced_mode: false,
+            first_run_completed: false,
         }
     }
 }
@@ -176,6 +235,22 @@ impl Settings {
     pub fn normalize(&mut self) {
         self.launch_timeout_seconds = self.launch_timeout_seconds.clamp(10, 180);
         self.graceful_close_seconds = self.graceful_close_seconds.clamp(2, 30);
+        self.client_limit = self.client_limit.clamp(1, 8);
+        self.desired_client_count = self.desired_client_count.clamp(1, self.client_limit);
+        self.secondary_volume_percent = self.secondary_volume_percent.min(100);
+    }
+
+    pub fn requested_launch_target(&self, current_clients: usize) -> Result<usize, String> {
+        if current_clients >= self.client_limit {
+            return Err(format!("Client limit reached ({}).", self.client_limit));
+        }
+        Ok(if self.launch_to_desired_count {
+            self.desired_client_count
+                .max(current_clients.saturating_add(1))
+                .min(self.client_limit)
+        } else {
+            current_clients.saturating_add(1)
+        })
     }
 }
 
@@ -184,4 +259,23 @@ pub struct Activity {
     pub timestamp: std::time::SystemTime,
     pub message: String,
     pub error: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desired_client_count_respects_current_count_and_soft_limit() {
+        let mut settings = Settings {
+            client_limit: 4,
+            desired_client_count: 3,
+            launch_to_desired_count: true,
+            ..Default::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.requested_launch_target(0).unwrap(), 3);
+        assert_eq!(settings.requested_launch_target(3).unwrap(), 4);
+        assert!(settings.requested_launch_target(4).is_err());
+    }
 }

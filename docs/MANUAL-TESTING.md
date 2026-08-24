@@ -69,5 +69,10 @@ The tracer cannot attribute the writer process through `ReadDirectoryChangesW`; 
 12. Verify 50/50, 70/30, vertical, swap, focus, and preferred-monitor behavior.
 13. Verify tray open, launch, tile, focus, close, disable, and exit actions.
 14. Verify protection-aware disable/window-close/exit warnings.
-15. Verify PowerShell Assist with PowerShell 7, Windows PowerShell compatibility where practical, and Rust-only mode.
+15. Verify PowerShell Assist with PowerShell 7 and Rust-only mode when PS7 is absent. Confirm Windows PowerShell 5.1 is not selected.
 16. Verify copied diagnostics contain no sensitive values.
+17. Verify per-client audio, resource presets/restoration, role swapping, auto-layout, tray mute/resource actions, and optional hotkeys.
+18. Verify the soft client limit and optional one-click target count stop on success, limit, or first failure.
+19. Verify `portable.flag` uses a sibling `data` directory, then test settings export/import/reset and a sanitized support bundle.
+20. Verify the recovery view identifies windowless/related processes and never removes aliases while Roblox is running.
+21. Validate update check/download/restart/rollback only after a real matching GitHub prerelease exists; never interrupt protected Roblox sessions.

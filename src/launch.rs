@@ -16,6 +16,10 @@ use std::{
 
 const STABLE_CLIENT_WINDOW: Duration = Duration::from_secs(2);
 
+pub fn should_use_isolated_path(protection_active: bool, existing_clients: usize) -> bool {
+    protection_active && existing_clients > 0
+}
+
 #[derive(Debug, Clone)]
 pub enum LaunchEvent {
     Starting(String),
@@ -211,6 +215,7 @@ impl LaunchManager {
         detection: Detection,
         selected: LaunchBackend,
         timeout: Duration,
+        launch_uri: String,
         required_protection: Option<ProtectionHealth>,
         isolated_launch: Option<IsolatedLaunch>,
     ) -> Result<(), String> {
@@ -225,13 +230,6 @@ impl LaunchManager {
             if let Err(message) = verify_protection(health) {
                 self.busy.store(false, Ordering::Release);
                 return Err(format!("{message} The backend was not launched."));
-            }
-            if isolated_launch.is_none() {
-                self.busy.store(false, Ordering::Release);
-                return Err(
-                    "Multi-account mode requires a unique per-instance launch path. The backend was not launched."
-                        .into(),
-                );
             }
         } else if isolated_launch.is_some() {
             self.busy.store(false, Ordering::Release);
@@ -286,24 +284,26 @@ impl LaunchManager {
                                 backend.label()
                             ));
                         }
-                        platform::shell_launch(&isolated.executable, Some("roblox:"))
+                        platform::shell_launch(&isolated.executable, Some(&launch_uri))
                     } else {
                         match backend {
                         LaunchBackend::Fishstrap | LaunchBackend::Bloxstrap => {
+                            let arguments = format!("-player {launch_uri}");
                             platform::shell_launch(
                                 installation.executable.as_ref().unwrap(),
-                                Some("-player roblox:"),
+                                Some(&arguments),
                             )
                         }
                         LaunchBackend::DefaultRoblox
                             if detection.roblox_protocol.healthy
-                                && detection.roblox_protocol.owner == "Default Roblox" =>
+                                && detection.roblox_protocol.owner == "Default Roblox"
+                                && launch_uri.to_ascii_lowercase().starts_with("roblox:") =>
                         {
-                            platform::shell_open_uri("roblox:")
+                            platform::shell_open_uri(&launch_uri)
                         }
                         LaunchBackend::DefaultRoblox => platform::shell_launch(
                             installation.executable.as_ref().unwrap(),
-                            Some("roblox:"),
+                            Some(&launch_uri),
                         ),
                         LaunchBackend::Auto => unreachable!(),
                         }
@@ -421,6 +421,7 @@ mod tests {
                     empty,
                     LaunchBackend::Auto,
                     Duration::from_secs(1),
+                    "roblox:".into(),
                     None,
                     None,
                 )
@@ -449,5 +450,13 @@ mod tests {
         );
         assert!(tracker.exited_new.contains(&30));
         assert!(tracker.closed_existing.contains(&20));
+    }
+
+    #[test]
+    fn protected_first_client_is_normal_and_additional_clients_are_isolated() {
+        assert!(!should_use_isolated_path(true, 0));
+        assert!(should_use_isolated_path(true, 1));
+        assert!(should_use_isolated_path(true, 2));
+        assert!(!should_use_isolated_path(false, 2));
     }
 }

@@ -1,14 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod diagnostics;
+mod history;
+mod hotkeys;
 mod instance_paths;
 mod launch;
+mod links;
 mod local_state;
 mod model;
 mod platform;
 mod powershell;
 mod settings;
+mod support;
 mod updater;
 
 use app::LauncherApp;
@@ -27,7 +32,16 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    let Some(instance_guard) = AppInstanceGuard::acquire("Wolfy_RobloxMultiAccountLauncher") else {
+    let smoke_test = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--smoke-test"));
+    let instance_name = if smoke_test {
+        format!(
+            "Wolfy_RobloxMultiAccountLauncher_Smoke_{}",
+            std::process::id()
+        )
+    } else {
+        "Wolfy_RobloxMultiAccountLauncher".into()
+    };
+    let Some(instance_guard) = AppInstanceGuard::acquire(&instance_name) else {
         platform::activate_existing_window("Roblox Multi-Account Launcher");
         return Ok(());
     };

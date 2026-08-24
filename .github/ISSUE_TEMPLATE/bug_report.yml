@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible launcher problem without credentials or private links.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Launcher version
+      placeholder: 3.1.0-beta.1
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Selected/resolved backend
+      options: [Auto / Fishstrap, Auto / Bloxstrap, Auto / stock Roblox, Fishstrap, Bloxstrap, Stock Roblox]
+    validations:
+      required: true
+  - type: dropdown
+    id: multi
+    attributes:
+      label: Was Multi-Account Mode enabled?
+      options: ["Yes", "No"]
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Review before posting. Never include credentials, cookies, auth tickets, or private links.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, cookie values, authentication tickets, and private server/share tokens.
+          required: true

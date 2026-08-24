@@ -38,6 +38,13 @@ const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const GITHUB_OWNER: &str = "Wolfyisdabest";
+pub const GITHUB_REPOSITORY: &str = "Roblox-Multi-Account-Launcher";
+pub const GITHUB_URL: &str = "https://github.com/Wolfyisdabest/Roblox-Multi-Account-Launcher";
+pub const RELEASES_URL: &str =
+    "https://github.com/Wolfyisdabest/Roblox-Multi-Account-Launcher/releases";
+pub const ISSUES_URL: &str =
+    "https://github.com/Wolfyisdabest/Roblox-Multi-Account-Launcher/issues/new/choose";
 
 #[derive(Debug, Clone)]
 pub struct UpdateConfig {
@@ -48,8 +55,12 @@ pub struct UpdateConfig {
 
 impl UpdateConfig {
     pub fn compiled() -> Option<Self> {
-        let owner = option_env!("RMAL_GITHUB_OWNER")?.trim();
-        let repository = option_env!("RMAL_GITHUB_REPOSITORY")?.trim();
+        let owner = option_env!("RMAL_GITHUB_OWNER")
+            .unwrap_or(GITHUB_OWNER)
+            .trim();
+        let repository = option_env!("RMAL_GITHUB_REPOSITORY")
+            .unwrap_or(GITHUB_REPOSITORY)
+            .trim();
         if owner.is_empty() || repository.is_empty() {
             return None;
         }
@@ -166,6 +177,7 @@ pub struct UpdateSnapshot {
     pub state: UpdateState,
     pub error: Option<String>,
     pub signing: &'static str,
+    pub rollback_available: bool,
 }
 
 #[derive(Debug)]
@@ -275,6 +287,8 @@ impl UpdateManager {
             } else {
                 "SHA-256 manifest required; signed manifests deferred"
             },
+            rollback_available: rollback_executable(&self.update_root).is_file()
+                && rollback_hash(&self.update_root).is_file(),
         }
     }
 
@@ -431,6 +445,28 @@ impl UpdateManager {
             .ok_or("No verified update is ready to install.")?;
         spawn_update_helper(prepared, &self.update_root)?;
         self.state = UpdateState::Installing;
+        Ok(())
+    }
+
+    pub fn prepare_rollback(&mut self) -> Result<(), String> {
+        if self.busy.load(Ordering::Acquire) {
+            return Err("An updater operation is already active.".into());
+        }
+        let staged_path = rollback_executable(&self.update_root);
+        let expected_sha256 = fs::read_to_string(rollback_hash(&self.update_root))
+            .map_err(|error| format!("Rollback metadata is unavailable: {error}"))?
+            .trim()
+            .to_ascii_lowercase();
+        if !staged_path.is_file() || normalize_sha256(&expected_sha256).is_err() {
+            return Err("No verified previous executable is available for rollback.".into());
+        }
+        self.prepared = Some(PreparedUpdate {
+            version: Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?,
+            staged_path,
+            expected_sha256,
+        });
+        self.state = UpdateState::ReadyToInstall;
+        self.error = None;
         Ok(())
     }
 }
@@ -602,6 +638,10 @@ struct UpdateManifest {
     version: String,
     filename: String,
     sha256: String,
+    channel: String,
+    release_url: String,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 fn check_for_update(
@@ -709,6 +749,27 @@ fn download_and_verify(
     if manifest.filename != EXECUTABLE_ASSET {
         return Err(OperationError::Message(
             "Update manifest names an unexpected executable.".into(),
+        ));
+    }
+    let expected_channel = if candidate.version.pre.is_empty() {
+        "stable"
+    } else {
+        "prerelease"
+    };
+    if !manifest.channel.eq_ignore_ascii_case(expected_channel) {
+        return Err(OperationError::Message(format!(
+            "Manifest channel {} does not match release channel {expected_channel}.",
+            manifest.channel
+        )));
+    }
+    if manifest.release_url != candidate.release_url {
+        return Err(OperationError::Message(
+            "Manifest release URL does not match the selected GitHub release.".into(),
+        ));
+    }
+    if manifest.signature.as_deref().is_some_and(str::is_empty) {
+        return Err(OperationError::Message(
+            "Manifest signature metadata is present but empty.".into(),
         ));
     }
     let expected = normalize_sha256(&manifest.sha256)?;
@@ -913,6 +974,16 @@ pub fn run_internal_mode(mode: InternalMode) -> bool {
         } => {
             let _ = wait_for_process_exit(helper_pid, Duration::from_secs(15));
             for path in [&helper, &staged, &backup] {
+                let preserved_rollback = path.file_name().and_then(|name| name.to_str())
+                    == Some("previous.exe")
+                    && path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("Rollback");
+                if preserved_rollback {
+                    continue;
+                }
                 remove_file_retry(path, 30, Duration::from_millis(100));
             }
             false
@@ -937,6 +1008,7 @@ fn run_helper(
         return Err("SECURITY ERROR: staged update failed SHA-256 re-verification; update was not installed.".into());
     }
     let backup = replace_portable_executable(target, staged)?;
+    preserve_rollback(update_root, &backup)?;
     let helper = std::env::current_exe()
         .map_err(|error| format!("Could not determine updater helper path: {error}"))?;
     let mut command = hidden_command(target);
@@ -999,6 +1071,30 @@ fn replace_portable_executable(target: &Path, staged: &Path) -> Result<PathBuf, 
         };
     }
     Ok(backup)
+}
+
+fn rollback_executable(root: &Path) -> PathBuf {
+    root.join("Rollback").join("previous.exe")
+}
+
+fn rollback_hash(root: &Path) -> PathBuf {
+    root.join("Rollback").join("previous.sha256")
+}
+
+fn preserve_rollback(root: &Path, backup: &Path) -> Result<(), String> {
+    let directory = root.join("Rollback");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create rollback storage: {error}"))?;
+    let executable = rollback_executable(root);
+    let temporary = directory.join("previous.part");
+    fs::copy(backup, &temporary)
+        .map_err(|error| format!("Could not preserve the previous executable: {error}"))?;
+    let hash = sha256_file(&temporary)?;
+    let _ = fs::remove_file(&executable);
+    fs::rename(&temporary, &executable)
+        .map_err(|error| format!("Could not finalize the rollback executable: {error}"))?;
+    fs::write(rollback_hash(root), hash)
+        .map_err(|error| format!("Could not save rollback verification metadata: {error}"))
 }
 
 fn rename_retry(from: &Path, to: &Path, attempts: usize, delay: Duration) -> Result<(), String> {
@@ -1251,7 +1347,7 @@ mod tests {
             metadata: Ok(Vec::new()),
             manifest: Some(
                 format!(
-                    r#"{{"version":"3.1.0","filename":"{EXECUTABLE_ASSET}","sha256":"{digest}"}}"#
+                    r#"{{"version":"3.1.0","filename":"{EXECUTABLE_ASSET}","sha256":"{digest}","channel":"stable","release_url":"https://fixture/release"}}"#
                 )
                 .into_bytes(),
             ),
@@ -1277,7 +1373,7 @@ mod tests {
             metadata: Ok(Vec::new()),
             manifest: Some(
                 format!(
-                    r#"{{"version":"3.1.0","filename":"{EXECUTABLE_ASSET}","sha256":"{}"}}"#,
+                    r#"{{"version":"3.1.0","filename":"{EXECUTABLE_ASSET}","sha256":"{}","channel":"stable","release_url":"https://fixture/release"}}"#,
                     "0".repeat(64)
                 )
                 .into_bytes(),
@@ -1359,23 +1455,27 @@ mod tests {
         let backup = replace_portable_executable(&target, &staged).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
         assert_eq!(fs::read(&backup).unwrap(), b"old");
+        preserve_rollback(&root, &backup).unwrap();
+        assert_eq!(fs::read(rollback_executable(&root)).unwrap(), b"old");
+        assert_eq!(
+            fs::read_to_string(rollback_hash(&root)).unwrap(),
+            sha256_file(&backup).unwrap()
+        );
         cleanup_stale_files(&root, Duration::ZERO);
         assert!(unrelated.is_file());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn updater_is_not_configured_without_real_coordinates() {
-        if option_env!("RMAL_GITHUB_OWNER").is_none()
-            || option_env!("RMAL_GITHUB_REPOSITORY").is_none()
-        {
-            assert!(UpdateConfig::compiled().is_none());
-            let manager = UpdateManager::new(
-                PathBuf::from(".tmp/tests/updater-not-configured"),
-                UpdateChannel::Stable,
-            );
-            assert_eq!(manager.snapshot().state, UpdateState::NotConfigured);
-        }
+    fn updater_uses_the_real_public_repository_defaults() {
+        let config = UpdateConfig::compiled().unwrap();
+        assert_eq!(config.owner, GITHUB_OWNER);
+        assert_eq!(config.repository, GITHUB_REPOSITORY);
+        let manager = UpdateManager::new(
+            PathBuf::from(".tmp/tests/updater-configured"),
+            UpdateChannel::Stable,
+        );
+        assert_eq!(manager.snapshot().state, UpdateState::Idle);
     }
 
     #[test]

@@ -25,7 +25,7 @@ The C# implementation already tried to respect thread-affine mutex ownership wit
 
 `LaunchManager` atomically rejects overlapping bootstraps. It snapshots current Roblox PIDs, verifies both singleton guards when multi-account mode is active, and waits with a bounded timeout for a genuinely new `RobloxPlayerBeta.exe` PID. A candidate must remain alive for two seconds before success. Existing clients cannot be mistaken for the new client.
 
-Normal mode launches the selected backend through `ShellExecuteExW`. Multi-account mode first asks `InstancePathManager` to resolve the newest valid `RobloxPlayerBeta.exe` version directory for the selected backend, creates a unique `Instances\Client-NNNN` NTFS junction to that directory, and directly starts the client through the alias path. Fishstrap/Bloxstrap remain responsible for installation, updates, and modifications; no Roblox files are copied or changed. Auto checks Fishstrap → Bloxstrap → stock and selects the first backend with both an installed launcher and a usable active version directory.
+Normal mode launches the selected backend through `ShellExecuteExW`. In Multi-Account Mode with zero clients, Client 1 also uses that normal backend path. With one or more existing clients, `InstancePathManager` resolves the newest valid `RobloxPlayerBeta.exe` version directory, creates a unique `Instances\Client-NNNN` NTFS junction, and directly starts the additional client through that alias. Fishstrap/Bloxstrap remain responsible for installation, updates, and modifications; no Roblox files are copied or changed. Auto checks Fishstrap → Bloxstrap → stock and selects the first usable backend.
 
 Each alias record tracks client ID, alias, target version, backend, and confirmed PID. A bound alias is removed only after its PID is gone. An unconfirmed alias is retained while any Roblox client is running. On restart, stale aliases are cleaned only when no Roblox clients exist. A backend update affects only new allocations; existing aliases and running clients are not retargeted.
 
@@ -47,6 +47,9 @@ Native APIs implement:
 - native mount-point reparse creation/verification for per-client launch paths;
 - existing-window activation;
 - notification-area menu integration.
+- documented process priority and `ProcessPowerThrottling` hints for reversible resource presets;
+- Core Audio session enumeration by process ID for per-client volume/mute;
+- optional `RegisterHotKey` shortcuts on a dedicated owner thread, without keyboard hooks;
 - metadata-only `ReadDirectoryChangesW` tracing under `Roblox\LocalStorage`.
 
 No injection, hooks, memory-content reads, registry writes, protocol rewrites, or elevation are used.
@@ -59,17 +62,17 @@ Bidirectional logout behavior has been manually validated three times while the 
 
 ## PowerShell Assist
 
-Readable scripts remain in `scripts` and compile into the binary with `include_str!`. Rust detects PS7, then Windows PowerShell, then uses Rust-only mode. Child processes use `CREATE_NO_WINDOW`, redirected streams, no profile, no interaction, timeouts, cancellation, and forced child cleanup after timeout.
+Readable scripts remain in `scripts` and compile into the binary with `include_str!`. Rust detects PowerShell 7 only; Windows PowerShell 5.1 is intentionally not used. Without PS7, the application stays in Rust-only mode. Child processes use `CREATE_NO_WINDOW`, redirected streams, no profile, no interaction, timeouts, cancellation, and forced child cleanup after timeout.
 
 Scripts return JSON. Diagnostic scripts are read-only. The repair script reports proposed actions only.
 
 ## Data
 
-Runtime data defaults to `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. `RMAL_DATA_DIR` redirects development/test data to project-contained `.tmp`. The application owns this persistence explicitly; generic `eframe` persistence is disabled. Multi-account mode is absent from the settings schema and always initializes disabled.
+Runtime data defaults to `%LOCALAPPDATA%\RobloxMultiAccountLauncher`. A `portable.flag` beside the executable selects a sibling `data` directory; `RMAL_DATA_DIR` is the development/test override. The application owns this persistence explicitly; generic `eframe` persistence is disabled. Multi-account mode is absent from the settings schema and always initializes disabled.
 
 ## Portable updater
 
-`UpdateManager` is an isolated, non-critical Rust subsystem. Compile-time GitHub owner/repository constants are optional; when absent the state is `NotConfigured`, no background thread/request starts, and core launching is unaffected. When configured, a delayed startup check uses GitHub's public Releases REST endpoint through bounded HTTPS without a token. Stable selection ignores drafts and prereleases; the Prerelease channel uses semantic-version ordering.
+`UpdateManager` is an isolated, non-critical Rust subsystem configured for the public `Wolfyisdabest/Roblox-Multi-Account-Launcher` repository. A delayed startup check uses GitHub's public Releases REST endpoint through bounded HTTPS without a token. Stable selection ignores drafts and prereleases; the Prerelease channel uses semantic-version ordering. Failure never blocks core launching.
 
 The explicit states are `NotConfigured`, `Idle`, `Checking`, `UpToDate`, `UpdateAvailable`, `Downloading`, `Verifying`, `ReadyToInstall`, `WaitingForSafeRestart`, `Installing`, and `Failed`. One atomic busy guard prevents overlapping checks/downloads. Cancellation is checked before requests and during bounded response streaming; partial executable files are deleted.
 
@@ -77,4 +80,4 @@ Installation requires an exact-version machine-readable manifest and matching SH
 
 The updater never kills Roblox or releases the singleton/cookie resources to update. Protection-active updates remain notices until sessions finish and Multi-Account Mode is disabled. Automatic installation, installers, services, scheduled tasks, elevation, external runtimes, WebViews, and browser-rendered release notes are not used.
 
-The configuration has a reserved public-verification-key slot, but signature verification is deliberately not claimed or enabled without a real release pipeline. SHA-256 is mandatory now; signed manifests remain required hardening before public release. See `docs/UPDATER.md`.
+The helper also preserves a SHA-256-verified previous executable under `Updates\Rollback`, enabling an explicit protection-aware rollback through the same replacement path. The configuration has a reserved public-verification-key slot, but signature verification is deliberately not claimed or enabled without offline signing infrastructure. SHA-256 is mandatory now; signed manifests remain deferred hardening. See `docs/UPDATER.md`.

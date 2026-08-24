@@ -77,6 +77,44 @@ impl InstancePathManager {
         &self.records
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn stale_aliases(&self) -> Vec<PathBuf> {
+        let active: HashSet<&Path> = self
+            .records
+            .iter()
+            .map(|record| record.alias_path.as_path())
+            .collect();
+        fs::read_dir(&self.root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(parse_client_id)
+                    .is_some()
+                    && is_junction(path)
+                    && !active.contains(path.as_path())
+            })
+            .collect()
+    }
+
+    pub fn cleanup_stale_now(&mut self, clients_running: bool) -> Result<Vec<String>, String> {
+        if clients_running {
+            return Err(
+                "Stale alias cleanup is blocked while any Roblox client is running.".into(),
+            );
+        }
+        let messages = self.cleanup_stale_aliases();
+        self.next_id = self.next_available_id();
+        Ok(messages)
+    }
+
     pub fn record_for_pid(&self, pid: u32) -> Option<&InstanceRecord> {
         self.records.iter().find(|record| record.pid == Some(pid))
     }

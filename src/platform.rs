@@ -1,4 +1,4 @@
-use crate::model::{Detection, Installation, LayoutMode, ProtocolInfo, RobloxClient};
+use crate::model::{Detection, Installation, LayoutMode, ProtocolInfo, ResourceMode, RobloxClient};
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -35,15 +35,18 @@ use windows_sys::Win32::{
             RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
         },
         Threading::{
-            CreateMutexW, GetProcessId, GetProcessTimes, OpenProcess,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ReleaseMutex, TerminateProcess,
-            WaitForSingleObject,
+            BELOW_NORMAL_PRIORITY_CLASS, CreateMutexW, GetProcessId, GetProcessTimes,
+            NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
+            ProcessPowerThrottling, ReleaseMutex, SetPriorityClass, SetProcessInformation,
+            TerminateProcess, WaitForSingleObject,
         },
     },
     UI::{
         Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
         WindowsAndMessaging::{
-            EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowTextW,
+            EnumWindows, FindWindowW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SW_RESTORE, SWP_NOZORDER,
             SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE,
         },
@@ -720,6 +723,7 @@ pub fn enumerate_clients() -> Vec<RobloxClient> {
             };
             let mut uptime = Duration::ZERO;
             let mut memory = 0;
+            let mut cpu_time = Duration::ZERO;
             if !handle.is_null() {
                 let mut created: FILETIME = unsafe { zeroed() };
                 let mut exited: FILETIME = unsafe { zeroed() };
@@ -737,6 +741,9 @@ pub fn enumerate_clients() -> Vec<RobloxClient> {
                         + 116444736000000000u128;
                     uptime = Duration::from_micros(
                         ((now_ticks as u64).saturating_sub(filetime_to_u64(created))) / 10,
+                    );
+                    cpu_time = Duration::from_micros(
+                        (filetime_to_u64(kernel).saturating_add(filetime_to_u64(user))) / 10,
                     );
                 }
                 let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
@@ -758,6 +765,7 @@ pub fn enumerate_clients() -> Vec<RobloxClient> {
                 pid: entry.th32ProcessID,
                 uptime,
                 working_set: memory,
+                cpu_time,
                 window,
                 title,
             });
@@ -775,6 +783,25 @@ pub fn enumerate_clients() -> Vec<RobloxClient> {
 }
 
 pub fn roblox_bootstrap_processes() -> Vec<(u32, String)> {
+    related_processes(&[
+        "RobloxPlayerLauncher.exe",
+        "RobloxPlayerInstaller.exe",
+        "RobloxInstaller.exe",
+    ])
+}
+
+pub fn launcher_related_processes() -> Vec<(u32, String)> {
+    related_processes(&[
+        "RobloxPlayerLauncher.exe",
+        "RobloxPlayerInstaller.exe",
+        "RobloxInstaller.exe",
+        "RobloxCrashHandler.exe",
+        "Fishstrap.exe",
+        "Bloxstrap.exe",
+    ])
+}
+
+fn related_processes(names: &[&str]) -> Vec<(u32, String)> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return vec![];
@@ -790,13 +817,9 @@ pub fn roblox_bootstrap_processes() -> Vec<(u32, String)> {
             .position(|ch| *ch == 0)
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-        if [
-            "RobloxPlayerLauncher.exe",
-            "RobloxPlayerInstaller.exe",
-            "RobloxInstaller.exe",
-        ]
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        if names
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
         {
             result.push((entry.th32ProcessID, name));
         }
@@ -1000,6 +1023,106 @@ pub fn tile_clients(
                 return Err(format!("Windows could not move Client {}.", client.number));
             }
         }
+    }
+    Ok(())
+}
+
+pub fn restore_clients(clients: &[RobloxClient]) {
+    for client in clients.iter().filter(|client| client.window != 0) {
+        unsafe {
+            ShowWindow(client.window as HWND, SW_RESTORE);
+        }
+    }
+}
+
+pub fn center_client(client: &RobloxClient, monitor_name: Option<&str>) -> Result<(), String> {
+    if client.window == 0 {
+        return Err(format!("Client {} has no visible window.", client.number));
+    }
+    let monitors = monitors();
+    let monitor = monitor_name
+        .and_then(|name| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.name.eq_ignore_ascii_case(name))
+        })
+        .or(monitors.first())
+        .ok_or("No monitor work area was available.")?;
+    let mut rect: RECT = unsafe { zeroed() };
+    if unsafe { GetWindowRect(client.window as HWND, &mut rect) } == 0 {
+        return Err("Windows could not read the Roblox window bounds.".into());
+    }
+    let width = (rect.right - rect.left).clamp(640, monitor.work.width);
+    let height = (rect.bottom - rect.top).clamp(480, monitor.work.height);
+    let x = monitor.work.x + (monitor.work.width - width) / 2;
+    let y = monitor.work.y + (monitor.work.height - height) / 2;
+    unsafe {
+        ShowWindow(client.window as HWND, SW_RESTORE);
+        if SetWindowPos(
+            client.window as HWND,
+            null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER,
+        ) == 0
+        {
+            return Err("Windows could not center the Roblox window.".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn set_resource_mode(pid: u32, mode: ResourceMode) -> Result<(), String> {
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return Err(format!(
+            "Windows could not open Roblox PID {pid} to apply {} (error {}).",
+            mode.label(),
+            unsafe { GetLastError() }
+        ));
+    }
+    let priority = match mode {
+        ResourceMode::Normal => NORMAL_PRIORITY_CLASS,
+        ResourceMode::Balanced | ResourceMode::AltSaver => BELOW_NORMAL_PRIORITY_CLASS,
+    };
+    if unsafe { SetPriorityClass(handle, priority) } == 0 {
+        let error = unsafe { GetLastError() };
+        unsafe { CloseHandle(handle) };
+        return Err(format!(
+            "Windows could not set the process priority for PID {pid} (error {error})."
+        ));
+    }
+    let mut throttling = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: if mode == ResourceMode::AltSaver {
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        } else {
+            0
+        },
+    };
+    let applied = unsafe {
+        SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            &mut throttling as *mut _ as *mut _,
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if applied == 0 {
+        return Err(format!(
+            "Priority was applied, but Windows could not update the power-throttling hint for PID {pid} (error {}).",
+            unsafe { GetLastError() }
+        ));
     }
     Ok(())
 }

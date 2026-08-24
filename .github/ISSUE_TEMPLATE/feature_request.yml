@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an external-only launcher or QOL improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: This does not require credentials, injection, memory access, anti-cheat manipulation, or an unapproved runtime.
+          required: true
