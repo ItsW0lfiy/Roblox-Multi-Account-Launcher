@@ -19,6 +19,17 @@ mod updater;
 use app::LauncherApp;
 use platform::AppInstanceGuard;
 
+fn app_icon() -> eframe::egui::IconData {
+    const SIZE: u32 = 64;
+    let rgba = include_bytes!("../assets/RobloxMultiAccountLauncher64.rgba").to_vec();
+    debug_assert_eq!(rgba.len(), (SIZE * SIZE * 4) as usize);
+    eframe::egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
+}
+
 fn main() -> eframe::Result {
     match updater::parse_internal_mode(std::env::args_os()) {
         Ok(Some(mode)) => {
@@ -49,7 +60,8 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Roblox Multi-Account Launcher")
             .with_inner_size([1060.0, 760.0])
-            .with_min_inner_size([900.0, 620.0]),
+            .with_min_inner_size([900.0, 620.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
